@@ -1,0 +1,21 @@
+/* sys/stdkern.h — kernel internal: one header to rule them all */
+#pragma once
+
+#include "../boot/types.h"
+#include "../drivers/io.h"
+#include "gdt.h"
+#include "idt.h"
+#include "ps2.h"
+#include "isr.h"
+#include "../drivers/font_data.h"
+#include "../drivers/pid.h"
+#include "../window/window.h"
+#include "../window/cursor.h"
+#include "display.h"
+#include "colour.h"
+#include "fill.h"
+#include "serial.h"
+#include "log.h"
+#include "stdio.h"
+#include "stdarg.h"
+#include "exception.h"

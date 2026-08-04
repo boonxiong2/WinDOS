@@ -1,0 +1,13 @@
+target/
+esp/
+kernel/*.o
+kernel/*.elf
+kernel/*.kern
+*.exe
+.idea/
+backup/
+uefi_rust/
+.hermes-tmp*
+*.log
+*.tmp
+main.rs.txt
