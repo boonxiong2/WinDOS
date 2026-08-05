@@ -617,8 +617,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                     } else if(s0>=' '&&login_len<31){
                         login_buf[login_len++]=s0;
                     }
-                    /* 重画登录窗口里的输入框：先清空区域(黑)，再写当前输入内容 */
-                    for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+y)*400+(160+x)]=0x00101010;
+                    /* 重画登录窗口里的输入框：先清空区域(黑)，再写当前输入内容（宽必须 400+2*SHADOW——与缓冲一致，否则清空错位→backspace 删不掉字符） */
+                    for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+SHADOW+y)*(400+2*SHADOW)+(160+SHADOW+x)]=0x00101010;
                     char line[40];
                     for(int i=0;i<login_len&&i<31;i++) line[i]=login_buf[i];
                     line[login_len>31?31:login_len]=0;
