@@ -176,16 +176,15 @@ static inline void sheet_refreshsub(struct SHTCTL *ctl, int vx0, int vy0, int vx
                     vx = sht->vx0 + bx;
                     if (vx >= 0 && vx < ctl->xsize) {
                         if (map[vy * ctl->xsize + vx] == sid
-                            || (h == sht->height && map[vy * ctl->xsize + vx] == 0
-                                && (buf[by * sht->bxsize + bx] & 0xFF000000))) {
-                            /* ★ 半透明（阴影）像素：当前层自己且该处无更高层遮挡（map==0）才画——合成
-                               （map==0 检查防止阴影被强制画到更高层(如登录窗口)上——否则"浮到别的窗口"） */
+                            || (h == sht->height && (buf[by * sht->bxsize + bx] & 0xFF000000))) {
+                            /* ★ 半透明（阴影）像素：当前层自己——无论单层/多层刷新都画（合成）
+                               （map 是 0——下层可见——但本层阴影必须画——否则光标移动会"擦掉"阴影） */
                             u32 pix = buf[by * sht->bxsize + bx];
                             if (pix & 0xFF000000) {
                                 /* ★ 阴影合成：像素 = 下层 − depth×step
                                    （越靠窗 depth 越大——每层减 step——变暗渐变） */
                                 u32 depth = pix & 0xFF;   /* 层数（draw_win_shadow 编码） */
-                                u32 dst = vram[vy * ctl->xsize + vx];   /* 读 vram——所有窗口阴影在重叠处叠加变暗（不只读 background） */
+                                u32 dst = vram[vy * ctl->xsize + vx];
                                 u32 add = depth;   /* 每层 −1（step=1——浅阴影） */
                                 u32 r = (dst >> 16) & 0xFF, g = (dst >> 8) & 0xFF, b = dst & 0xFF;
                                 /* 减：阴影变暗（if/else clamp——三元会触发 clang -O2 优化陷阱 E06） */
@@ -262,9 +261,7 @@ static inline void sheet_refresh(struct SHEET *sht, int bx0, int by0, int bx1, i
         /* ★ 阴影联动：任意层刷新后——若与阴影层区域重叠——重画阴影层（合成读新下层） */
         for (int si = 0; si < g_shadow_cnt; si++) {
             struct SHEET *gs = g_shadow_shts[si];
-            /* 只重画"高于刷新层"的阴影层（其下层内容变了——阴影需重新合成）。
-               刷新层 >= 阴影层（如 backspace 刷新 login——login 是最高的阴影）→ 阴影下层没变 → 不重画 → 不叠加加重 */
-            if (gs && gs != sht && gs->height > sht->height) {
+            if (gs && gs != sht && gs->height >= 0) {
                 int sx0 = gs->vx0, sy0 = gs->vy0;
                 int sx1 = sx0 + gs->bxsize, sy1 = sy0 + gs->bysize;
                 int rx0 = sht->vx0 + bx0, ry0 = sht->vy0 + by0;
