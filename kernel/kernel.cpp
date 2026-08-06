@@ -122,8 +122,13 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title) {
 #pragma clang loop unroll(disable)
         for (int x = 0; x < W; x++) {
             int dx, dy;
-            dx = (x < SHADOW) ? SHADOW - x : (x >= SHADOW + w ? x - (SHADOW + w - 1) : 0);
-            dy = (y < SHADOW) ? SHADOW - y : (y >= SHADOW + h ? y - (SHADOW + h - 1) : 0);
+            /* 三元表达式——clang -O2 陷阱（5706 E06/死循环）——改 if/else */
+            if (x < SHADOW) dx = SHADOW - x;
+            else if (x >= SHADOW + w) dx = x - (SHADOW + w - 1);
+            else dx = 0;
+            if (y < SHADOW) dy = SHADOW - y;
+            else if (y >= SHADOW + h) dy = y - (SHADOW + h - 1);
+            else dy = 0;
             if (dx != 0 || dy != 0) {           /* if 包住——不用 continue */
                 int d = dx > dy ? dx : dy;
                 if (d > SHADOW) d = SHADOW;
@@ -258,50 +263,53 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     }
     { char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] build: %s", build_date); out_file_str(dbg); }
     { u64 bs2, be2;
-      __asm__ volatile("lea %1, %0" : "=r"(bs2) : "m"(_bss_start));
-      __asm__ volatile("lea %1, %0" : "=r"(be2) : "m"(_bss_end));
-      char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] bss %x-%x sz=%x",(u32)bs2,(u32)be2,(u32)(be2-bs2)); LOG_INFO(dbg); }
+        __asm__ volatile("lea %1, %0" : "=r"(bs2) : "m"(_bss_start));
+        __asm__ volatile("lea %1, %0" : "=r"(be2) : "m"(_bss_end));
+        char dbg[64];
+        ksprintf(dbg,"[KERNEL/INFO] bss %x-%x sz=%x",(u32)bs2,(u32)be2,(u32)(be2-bs2)); LOG_INFO(dbg); }
     gdt_init();  // own GDT + TSS descriptor (was missing!)
     /* 关键：UEFI 的页表把低 4MB 标成"仅内核可访问"(US=0)——用户态(Ring3)
        一访问就 #PF。这里把 PML4E/PDPE/PDE 的 US 位(bit2)全置 1，
        让用户态能用低内存（用户栈/用户代码都在这里）。
        权限是四级页表 AND 出来的：任何一级 US=0 都不行，所以全改。 */
-    { u64 cr3v; __asm__ volatile("movq %%cr3, %0" : "=r"(cr3v));
-      u64 *pml4t = (u64*)cr3v;
-      u64 *pdptt = (u64*)(pml4t[0] & 0xFFFFF000);
-      u64 *pdt = (u64*)(pdptt[0] & 0xFFFFF000);
-      /* UEFI marks page-table pages read-only; CR0.WP=1 makes Ring0 writes
+    {   u64 cr3v; __asm__ volatile("movq %%cr3, %0" : "=r"(cr3v));
+        u64 *pml4t = (u64*)cr3v;
+        u64 *pdptt = (u64*)(pml4t[0] & 0xFFFFF000);
+        u64 *pdt = (u64*)(pdptt[0] & 0xFFFFF000);
+        /* UEFI marks page-table pages read-only; CR0.WP=1 makes Ring0 writes
          to them #PF. Clear WP around the edits, then restore. */
-      u64 cr0v; __asm__ volatile("movq %%cr0, %0" : "=r"(cr0v));
-      __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v & ~0x10000ULL) : "memory");
-      { char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] PTE %x %x %x",(u32)pml4t[0],(u32)pdptt[0],(u32)pdt[0]); out_file_str(dbg); }
-      /* permission is ANDed across ALL levels: PML4E/PDPE were US=0 (0x23)! */
-      pml4t[0] |= 0x4;  /* PML4E US=1 */
-      pdptt[0] |= 0x4;  /* PDPTE US=1 */
-      pdt[0] |= 0x4;    /* 0-2MB US=1 */
-      pdt[1] |= 0x4;    /* 2-4MB US=1 */
-      pdt[2] |= 0x4;    /* 4-6MB US=1 — BSS grew past 4MB (back_buf 1.92MB) */
-      pdt[3] |= 0x4;    /* 6-8MB US=1 */
-      __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v) : "memory");
-      /* flush TLB — stale US=0 entries would still #PF from Ring3!
+        u64 cr0v; __asm__ volatile("movq %%cr0, %0" : "=r"(cr0v));
+        __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v & ~0x10000ULL) : "memory");
+        { char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] PTE %x %x %x",(u32)pml4t[0],(u32)pdptt[0],(u32)pdt[0]); out_file_str(dbg); }
+        /* permission is ANDed across ALL levels: PML4E/PDPE were US=0 (0x23)! */
+        pml4t[0] |= 0x4;  /* PML4E US=1 */
+        pdptt[0] |= 0x4;  /* PDPTE US=1 */
+        pdt[0] |= 0x4;    /* 0-2MB US=1 */
+        pdt[1] |= 0x4;    /* 2-4MB US=1 */
+        pdt[2] |= 0x4;    /* 4-6MB US=1 — BSS grew past 4MB (back_buf 1.92MB) */
+        pdt[3] |= 0x4;    /* 6-8MB US=1 */
+        __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v) : "memory");
+        /* flush TLB — stale US=0 entries would still #PF from Ring3!
          mov cr3 + invlpg for the low 4MB (QEMU big-page TLB is sticky) */
-      __asm__ volatile("movq %0, %%cr3" :: "r"(cr3v) : "memory");
-      for (u64 va = 0; va < 0x400000; va += 0x1000)
-          __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
-      LOG_INFO("US bits set"); }
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3v) : "memory");
+        for (u64 va = 0; va < 0x400000; va += 0x1000)
+            __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
+        LOG_INFO("US bits set");
+    }
     /* 设 LSTAR MSR（0xC0000082）= syscall 指令的入口——
        用户态执行 syscall 时 CPU 自动跳到这里（进内核） */
-    { u64 sce; __asm__ volatile("lea %1, %0" : "=r"(sce) : "m"(syscall_entry_asm));
-      __asm__ volatile("movl $0xC0000082, %%ecx; movl %0, %%eax; movl %1, %%edx; wrmsr"
-                       :: "r"((u32)sce), "r"((u32)(sce >> 32))
-                       : "eax", "ecx", "edx", "memory");
-      LOG_INFO("LSTAR set"); }
+    {   u64 sce; __asm__ volatile("lea %1, %0" : "=r"(sce) : "m"(syscall_entry_asm));
+        __asm__ volatile("movl $0xC0000082, %%ecx; movl %0, %%eax; movl %1, %%edx; wrmsr"
+                         :: "r"((u32)sce), "r"((u32)(sce >> 32))
+                         : "eax", "ecx", "edx", "memory");
+        LOG_INFO("LSTAR set");
+    }
     LOG_INFO("STARTUP gdt");
-        u32 *fb = (u32*)info->fb_base;
+    u32 *fb = (u32*)info->fb_base;
     u32 hr=info->hr, vr=info->vr, st=info->stride;
     disp_init(fb, hr, vr, st);
     LOG_INFO("STARTUP disp");
-        LOG_INFO("STARTUP pre");
+    LOG_INFO("STARTUP pre");
     u128 range = 0;
     pid_t pid = pid_alloc();
     LOG_INFO("STARTUP pid");
@@ -326,28 +334,28 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             
     // ── 创建 "WinDOS" 演示窗口（带渐变阴影——合成：下层−depth×step）──
     static u32 win_buf[(200+2*SHADOW)*(120+2*SHADOW)];
-        draw_win_shadow(win_buf, 200, 120, "WinDOS");
-        LOG_INFO("STARTUP drawn");
-        /* 背景图层（sht_back）——独立缓冲 back_buf（原版做法）：
-           背景是最底图层（sid=0，map 里 0 就代表"桌面"）
-           必须用独立内存缓冲而不是直接用 fb 本身（直接自拷贝慢）
-           back_buf 内容 = 桌面青绿 + 底部任务栏黑色（和上面画的桌面一致，
-           否则拖窗口经过任务栏会把任务栏擦掉） */
-        static u32 back_buf[800*600];
-        /* background + taskbar (bottom 40px black) — must MATCH the desktop
-           drawn by shtctl_refresh_all, or dragging a window over the taskbar
-           erases it (back sheet repaints its buffer over it) */
-        for (u32 y = 0; y < vr; y++) {
-            u32 bg = (y >= vr-40) ? 0 : 0x00008080;
-            for (u32 x = 0; x < hr; x++) back_buf[y*hr+x] = bg;
-        }
-        struct SHEET *sht_back = sheet_alloc(&shtctl);
-        sheet_setbuf(sht_back, back_buf, hr, vr, (u32)-1);
-        sht_back->vx0 = 0; sht_back->vy0 = 0;
-        sheet_updown(sht_back, 0);
-        struct SHEET *win_sht = sheet_alloc(&shtctl);
-        sheet_setbuf(win_sht, win_buf, 200 + 2 * SHADOW, 120 + 2 * SHADOW, COL_INV);
-        win_sht->vx0 = 80 - SHADOW; win_sht->vy0 = 72 - SHADOW;
+    draw_win_shadow(win_buf, 200, 120, "WinDOS");
+    LOG_INFO("STARTUP drawn");
+    /* 背景图层（sht_back）——独立缓冲 back_buf（原版做法）：
+       背景是最底图层（sid=0，map 里 0 就代表"桌面"）
+       必须用独立内存缓冲而不是直接用 fb 本身（直接自拷贝慢）
+       back_buf 内容 = 桌面青绿 + 底部任务栏黑色（和上面画的桌面一致，
+       否则拖窗口经过任务栏会把任务栏擦掉） */
+    static u32 back_buf[800*600];
+    /* background + taskbar (bottom 40px black) — must MATCH the desktop
+       drawn by shtctl_refresh_all, or dragging a window over the taskbar
+       erases it (back sheet repaints its buffer over it) */
+    for (u32 y = 0; y < vr; y++) {
+        u32 bg = (y >= vr-40) ? 0 : 0x00008080;
+        for (u32 x = 0; x < hr; x++) back_buf[y*hr+x] = bg;
+    }
+    struct SHEET *sht_back = sheet_alloc(&shtctl);
+    sheet_setbuf(sht_back, back_buf, hr, vr, (u32)-1);
+    sht_back->vx0 = 0; sht_back->vy0 = 0;
+    sheet_updown(sht_back, 0);
+    struct SHEET *win_sht = sheet_alloc(&shtctl);
+    sheet_setbuf(win_sht, win_buf, 200 + 2 * SHADOW, 120 + 2 * SHADOW, COL_INV);
+    win_sht->vx0 = 80 - SHADOW; win_sht->vy0 = 72 - SHADOW;
     LOG_INFO("STARTUP wadd");
     sheet_updown(win_sht, 1);
     g_shadow_shts[g_shadow_cnt++] = win_sht;   /* ★ 注册阴影窗口——刷新联动 */
@@ -374,46 +382,60 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
        默认所有中断向量 → isr_default；异常 0-31 → 死屏(BSOD)
        0x20=PIT 时钟  0x21=键盘  0x2c=鼠标
        然后 PIC 初始化、PIT 定时器、键盘/鼠标驱动、开中断(sti) */
+    /* ★ 内核栈(TSS.RSP0)：中断/系统调用切换的栈——必须在开中断(sti)前设置，
+       否则中断触发→CPU 切到未设置的 RSP0(垃圾栈)→中断处理卡死(freeze) */
+    static u8 kstack[16384];
+    u64 ksp;
+    __asm__ volatile("lea %1, %0" : "=r"(ksp) : "m"(kstack[0]));
+    tss_set_rsp0(ksp + sizeof(kstack));
+
     for(int i=0;i<256;i++)set_gate(i,(void*)isr_default);
     exc_init();   // 异常 0-31 → 蓝屏
     set_gate(0x20,(void*)isr20);
     set_gate(0x21,(void*)isr21);
     set_gate(0x2c,(void*)isr2c);
-    lidt_idt();pic_init();pit_init();init_keyboard();mouse_enable();__asm__ volatile("sti");
+    { u64 g = ((u64)idt[0x20].hi<<32)|((u64)idt[0x20].mid<<16)|idt[0x20].lo; char dbg[48]; ksprintf(dbg,"[int] gate20=%x",(u32)g); LOG_INFO(dbg); }
+    lidt_idt(); LOG_INFO("[int] lidt"); pic_init(); LOG_INFO("[int] pic"); pit_init(); LOG_INFO("[int] pit"); init_keyboard(); LOG_INFO("[int] kbd"); mouse_enable(); LOG_INFO("[int] mouse"); __asm__ volatile("sti"); LOG_INFO("[int] sti");
     LOG_INFO("STARTUP idt");
     
+    LOG_INFO("[login]11 refresh");
     shtctl_refresh_all(&shtctl);
     LOG_INFO("STARTUP refresh");
     MP m={};int errors=0;
     int key_shift=0, key_leds=0, bsod_triggered=0;
-    struct SHEET *sht=0; int mmx=-1, mmy=-1; int x,y;
-    /* 内核栈(kstack)：中断/系统调用从用户态进来时，CPU 自动切到这个栈
-       （TSS.RSP0——由 tss_set_rsp0 设置）。用户态自己的栈在用户程序里 */
-    static u8 kstack[16384];
-    u64 ksp;
-    __asm__ volatile("lea %1, %0" : "=r"(ksp) : "m"(kstack[0]));  // 取运行时地址
-    tss_set_rsp0(ksp + sizeof(kstack));
-
+    struct SHEET *sht=nullptr; int mmx=-1, mmy=-1; int x,y;
     // ── 登录窗口（Ring 0 界面，不可关闭——保证系统入口永远存在）──
     // login_buf = 用户名输入缓冲（最长 32）
     // login_wbuf = 登录窗口的像素缓冲（400x200）
     // 输入 "sysdebug" 按回车 → Ring 1；其他名字 → Ring 3
+    LOG_INFO("[login]1 buf");
     static char login_buf[32]; int login_len = 0; int logged_in = 0;
+    LOG_INFO("[login]2 wbuf");
     static u32 login_wbuf[(400+2*SHADOW)*(200+2*SHADOW)];   /* ★ 带阴影（加大缓冲） */
+    LOG_INFO("[login]3 draw_shadow");
     draw_win_shadow(login_wbuf, 400, 200, "WinDOS Login");   /* ★ 阴影窗口 */
+    LOG_INFO("[login]4 put_str");
     put_str(login_wbuf, 400+2*SHADOW, 20+SHADOW, 40+SHADOW, "Username:", 0x00CCCCCC);
     for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+SHADOW+y)*(400+2*SHADOW)+(160+SHADOW+x)]=0x00101010;
+    LOG_INFO("[login]5 alloc");
     struct SHEET *login_sht = sheet_alloc(&shtctl);
+    LOG_INFO("[login]6 setbuf");
     sheet_setbuf(login_sht, login_wbuf, 400 + 2 * SHADOW, 200 + 2 * SHADOW, COL_INV);
+    LOG_INFO("[login]7 pos");
     login_sht->vx0=hr/2-200-SHADOW; login_sht->vy0=vr/2-100-SHADOW;
+    LOG_INFO("[login]8 updown");
     sheet_updown(login_sht, 3);
+    LOG_INFO("[login]9 shadow");
     g_shadow_shts[g_shadow_cnt++] = login_sht;   /* ★ 登录窗口也注册为阴影窗口 */
+    LOG_INFO("[login]10 cur");
     sheet_updown(cur_sht, shtctl.top);   /* ★ 光标最顶（top 内——不超界——后 updown 的在上） */
     shtctl_refresh_all(&shtctl);   /* ★ 登录窗口创建后必须全屏刷新——否则启动时
                                       显示异常（map 没更新——部分黑）——拖动才恢复 */
+    LOG_INFO("[login]12 glogin");
     g_login_sht = login_sht;
     LOG_INFO("STARTUP login");
     /* ── ExFAT 测试：初始化 + 列根目录（fs/exfat.cpp——QEMU 第二块盘）── */
+    LOG_INFO("[FS] exfat-test enter");
     {
         /* ATA 诊断：Secondary 通道状态（0x177）——0xFF=无盘，0x50/0x58=盘就绪 */
         char adbg[64];
@@ -433,6 +455,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             for (volatile int d2 = 0; d2 < 100000; d2++);
             out8(0x3F6, 0x00);   /* 复位完成（nIEN 清） */
             for (volatile int d2 = 0; d2 < 100000; d2++);
+            LOG_INFO("[FS] ATA manual-read");
             for (int dv = 0; dv <= 2; dv++) {   /* 0=master读 1=slave读 2=slave IDENTIFY */
                 int sel = (dv == 2) ? 1 : dv;
                 out8(0x1F6, sel ? 0xF0 : 0xE0);   /* 选盘 */
@@ -454,7 +477,9 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 out_file_str(adbg);
             }
         }
+        LOG_INFO("[FS] exfat_init call");
         int r = exfat_init();
+        LOG_INFO("[FS] exfat_init done");
         /* ── QEMU 检测：CPUID hypervisor leaf 0x40000000
            QEMU TCG → "TCGTCGTCG"、KVM → "KVMKVMKVM"（真硬件无 hypervisor） ── */
         {
@@ -526,7 +551,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 int wr = exfat_write_file("TEST.TXT", (const u8*)wdata, 14);
                 if (wr == 0) {
                     out_file_str("[FS] write OK\n");
-                    struct EXFAT_FILE_INFO wfi;
+                    struct EXFAT_FILE_INFO wfi = {};   /* 初始化——未初始化记录类型（Clang-Tidy 警告）潜在崩溃 */
                     if (exfat_find(2, "TEST.TXT", &wfi) == 0) {
                         u8 rbuf[64];
                         if (exfat_read_file(wfi.first_cluster, wfi.data_len, rbuf) == 0) {
@@ -550,9 +575,11 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
        有键盘输入 → 处理（登录输入/Shift/CapsLock/Ctrl+Shift+B）
        鼠标 → 不在主循环了！isr2c 中断里直接处理（见 sys/isr.h）
        每 200 个时钟 tick 打印一次心跳日志（证明系统活着） */
+    LOG_INFO("[FS] mainloop enter");
     volatile u32 last_tick = 0; int hb = 0;
     u32 t0_sec = (u32)info->tm_hour * 3600 + (u32)info->tm_min * 60 + (u32)info->tm_sec;   /* GetTime 初始时间转秒 */
-    for(;;){
+    LOG_INFO("Main 'for (;;)'entering.");
+    for (int n = 0; true; n++) {
         io_cli();
         /* ORIGINAL: NO per-frame sheet_updown — cursor top is handled in the
            click handler only (sheet_updown(cur_sht, top) there). Per-frame

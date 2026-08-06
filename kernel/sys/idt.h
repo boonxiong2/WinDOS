@@ -37,7 +37,8 @@ void pit_init() {
 extern u64 KERN_BASE;  /* runtime base: link addr + KERN_BASE = runtime addr */
 
 void set_gate(int n, void *h) {
-    u64 a = KERN_BASE + (u64)h;  /* h is LINK address — add runtime base! */
+    volatile u64 KB = KERN_BASE;  /* 强制读——clang -O2 内联会复用 rax 把 KERN_BASE 读成垃圾（gate20 实测 0x3be6c37f） */
+    u64 a = KB + (u64)h;  /* h is LINK address — add runtime base! */
     idt[n].lo=a;
     idt[n].mid=a>>16;
     idt[n].hi=a>>32; 

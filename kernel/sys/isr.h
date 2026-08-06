@@ -16,7 +16,7 @@ extern int g_mmx, g_mmy;
    发 EOI(0x60) 告诉 PIC 中断处理完
    注意：这里不再读鼠标——鼠标归 isr2c 独占（之前 isr20 也读 0x60
    和 isr2c 抢数据导致光标乱飞） */
-extern "C" void isr20_handler() { extern volatile u32 g_ticks; g_ticks++; out8(0x20,0x60); }
+extern "C" void isr20_handler() { static int c20=0; if(!c20){out8(0x3F8,'2');out8(0x3F8,'0');out8(0x3F8,':');out8(0x3F8,'\n');c20=1;} extern volatile u32 g_ticks; g_ticks++; out8(0x20,0x60); }
 volatile u32 _isr21_fires = 0;
 /* 键盘中断（IRQ1）：
    读 0x64 状态：bit5=0 才是键盘数据（bit5=1 是鼠标数据——留给 isr2c）
@@ -42,6 +42,7 @@ extern "C" void isr21_handler() {
    然后读 0x64：bit5=1 才是鼠标数据（bit5=0 是键盘——留给 isr21） */
 #define SHADOW 16   /* 窗口阴影宽度（与 kernel.cpp 的 draw_win_shadow 一致——拖动/关闭判定要偏移） */
 extern "C" void isr2c_handler() {
+    static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
     u8 s=in8(0x64);
     if((s&0x01)&&(s&0x20)){

@@ -14,7 +14,7 @@ void mwait() { while(in8(0x64)&0x02){} }
 void mouse_enable() {
     mwait(); out8(0x64,0xD4); mwait(); out8(0x60,0xF4);
     /* verify the mouse ACKs 0xFA — drain it here so md() starts clean */
-    int t=0; while(!(in8(0x64)&0x01) && t<300000) t++;
+    int t=0; while(!(in8(0x64)&0x01) && t<2000) t++;   /* 等 ACK 减到 2k 次——QEMU PS/2 设备未响应时原 30 万次 in8 卡死(freeze) */
     if(in8(0x64)&0x01) in8(0x60);   /* consume 0xFA ACK */
 }
 
