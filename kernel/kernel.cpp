@@ -163,6 +163,7 @@ struct SHEET *g_login_sht = 0;
    其他调用号 → 返回 -1（错误，不静默放过）
    注意：不能用 register-asm 变量读寄存器（编译器会优化掉 if），
    所以用显式 movq 读 RAX/RDI。 */
+extern "C" u8 _bss_end;   /* 用户可访问内存上界（按它推导——见下面 US 位翻转） */
 extern "C" u64 syscall_dispatch(void) {
     /* register-asm variables are UB (compiler optimizes the if away) —
        read regs explicitly with mov */
@@ -170,7 +171,12 @@ extern "C" u64 syscall_dispatch(void) {
     __asm__ volatile("movq %%rax, %0" : "=r"(num));
     __asm__ volatile("movq %%rdi, %0" : "=r"(a1));
     if (num == 1) {
-        if ((u64)a1 < 0x1000 || (u64)a1 >= 0x800000) {out_file_str("[KERNEL/USER_API/EXCPTION]\
+        /* 用户可访问区 = 已翻 US=1 的低内存（与上面 US 位翻转同一来源）。
+           不能写死 8MB：.bss 涨到 10.6MB 后用户字符串/栈都在 8MB 以上，
+           写死上限会把合法指针全判成越界。按 _bss_end 向上取整到 2MB 页。 */
+        u64 be; __asm__ volatile("lea %1, %0" : "=r"(be) : "m"(_bss_end));
+        u64 lim = (be + 0x1FFFFF) & ~0x1FFFFFull;
+        if ((u64)a1 < 0x1000 || (u64)a1 >= lim) {out_file_str("[KERNEL/USER_API/EXCPTION]\
                              Application used Pointer DIDN'T in user mem area/");return -1;  /* 指针必须在用户区 */}
         out_file_str((char*)a1);
         return 0;
@@ -284,10 +290,15 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
         /* permission is ANDed across ALL levels: PML4E/PDPE were US=0 (0x23)! */
         pml4t[0] |= 0x4;  /* PML4E US=1 */
         pdptt[0] |= 0x4;  /* PDPTE US=1 */
-        pdt[0] |= 0x4;    /* 0-2MB US=1 */
-        pdt[1] |= 0x4;    /* 2-4MB US=1 */
-        pdt[2] |= 0x4;    /* 4-6MB US=1 — BSS grew past 4MB (back_buf 1.92MB) */
-        pdt[3] |= 0x4;    /* 6-8MB US=1 */
+        /* US 必须覆盖内核镜像 + .bss 占用的每一个 2MB 页：
+           用户栈就在 .bss 里（jump_user 的 static 数组），写死 0..8MB
+           的列表一旦有缓冲变大就失效——back_buf 涨到 1920x1080 后
+           .bss 到 ~10.4MB、user_stack 落在 10.8MB，Ring3 第一条 push
+           就 #PF（errcode 7 = P|W|U）。改成按 _bss_end 推导。 */
+        u64 be_rt;
+        __asm__ volatile("lea %1, %0" : "=r"(be_rt) : "m"(_bss_end));
+        for (u64 i = 0; i <= (be_rt >> 21); i++)
+            if (pdt[i] & 1) pdt[i] |= 0x4;   /* 只翻已存在的 PDE */
         __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v) : "memory");
         /* flush TLB — stale US=0 entries would still #PF from Ring3!
          mov cr3 + invlpg for the low 4MB (QEMU big-page TLB is sticky) */
@@ -341,7 +352,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
        必须用独立内存缓冲而不是直接用 fb 本身（直接自拷贝慢）
        back_buf 内容 = 桌面青绿 + 底部任务栏黑色（和上面画的桌面一致，
        否则拖窗口经过任务栏会把任务栏擦掉） */
-    static u32 back_buf[800*600];
+    /* 按最大模式(1920x1080)开——下面填充循环和 sheet_setbuf 都用 hr/vr，
+       800x600 的数组按 1280x800 用会越界写 ~2.1MB，正好糊掉
+       cur_buf / kstack / login_wbuf / g_fb / tss / user_stack */
+    static u32 back_buf[1920*1080];
     /* background + taskbar (bottom 40px black) — must MATCH the desktop
        drawn by shtctl_refresh_all, or dragging a window over the taskbar
        erases it (back sheet repaints its buffer over it) */
@@ -398,6 +412,11 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     lidt_idt(); LOG_INFO("[int] lidt"); pic_init(); LOG_INFO("[int] pic"); pit_init(); LOG_INFO("[int] pit"); init_keyboard(); LOG_INFO("[int] kbd"); mouse_enable(); LOG_INFO("[int] mouse"); __asm__ volatile("sti"); LOG_INFO("[int] sti");
     LOG_INFO("STARTUP idt");
     
+    /* 桌面刷新 + 登录窗口创建期间保持中断关闭：鼠标中断 isr2c 也在动图层表
+       （sheet_free/shtctl_refresh_all/sheet_updown），这些操作不可重入——
+       鼠标包正好落在刷新中间会踩坏图层表（野指针写 → #PF）。
+       IF 由主循环的 io_stihlt() 恢复。 */
+    io_cli();
     LOG_INFO("[login]11 refresh");
     shtctl_refresh_all(&shtctl);
     LOG_INFO("STARTUP refresh");
@@ -621,6 +640,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 }
                 if(!logged_in){   // 还没登录 → 处理登录输入
                     if(s0==0x0a){ /* 回车：检查用户名 */
+                        LOG_INFO("[login] enter");
                         login_buf[login_len]=0;
                         out_file_str("\n[LOGIN] user='");
                         out_str(login_buf);
@@ -633,11 +653,19 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                             out_file_str(dbg);
                             out_file_str("\n");}
                         logged_in=1;
+                        LOG_INFO("[login] ok");
                         /* 登录完成——销毁登录窗口（不让它留在桌面上）
-                           然后全屏刷新一次（画掉窗口残留） */
+                           然后全屏刷新一次（画掉窗口残留）。
+                           整个拆除→sysret 窗口内关中断：否则 isr2c 会在
+                           sheet_free/shtctl_refresh_all 中间重入图层表。
+                           sysret 从 R11(0x202) 恢复 IF=1——用户态照常有中断。 */
+                        io_cli();
                         sheet_free(login_sht);
+                        LOG_INFO("[login] freed");
                         shtctl_refresh_all(&shtctl);
+                        LOG_INFO("[login] refreshed");
                         {char dbg[32]; ksprintf(dbg,"J%d ",ring); out_str(dbg);}
+                        LOG_INFO("[login] jump_user");
                         jump_user(user_main, ring);   // ← 跳进用户态（sysret）
                     } else if(s0==0x08){ /* Backspace */
                         if(login_len>0) login_len--;
@@ -650,7 +678,9 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                     for(int i=0;i<login_len&&i<31;i++) line[i]=login_buf[i];
                     line[login_len>31?31:login_len]=0;
                     put_str(login_wbuf, 400 + 2 * SHADOW, 160 + SHADOW, 40 + SHADOW, line, 0x00FFFFFF);
+                    io_cli();  /* 图层操作——不能被 isr2c 打断 */
                     sheet_refresh(login_sht, 150 + SHADOW, 32 + SHADOW, 410 + SHADOW, 64 + SHADOW);   /* 内容偏移+SHADOW */
+                    io_sti();
                 }
             }
             if(d==0x2a) key_shift|=1;

@@ -196,13 +196,13 @@ fn start_kernel() -> ! {
     uinfo_hex("kern src", kern_src); uinfo_hex("kern len", kern_len);
     if kern_len == 0 { ucrit("no kern"); bsod(mode.fb, stride, hr, vr); }
     /* 分配内核区（kern_len + 6MB BSS + BootInfo）*/
-    let total = kern_len + 0x600000 + core::mem::size_of::<BootInfo>();
+    let total = kern_len + 0x1000000 + core::mem::size_of::<BootInfo>();   /* +16MB：.bss 已涨到 ~10.3MB（back_buf 1.92MB 等） */
     let mut kern: usize = 0;
     unsafe { ap(0,2,(total+0xFFF)>>12,&mut kern); }
     uinfo_hex("kern alloc", kern); uinfo_hex("total", total);
     if kern == 0 { ucrit("kern alloc fail"); bsod(mode.fb, stride, hr, vr); }
     unsafe { core::ptr::copy_nonoverlapping(kern_src as *const u8, kern as *mut u8, kern_len); }
-    /* BootInfo at END of allocation（内核 .bss 清零会覆盖 bin 末尾——放最后）*/
+    /* BootInfo 放分配区最后（16MB .bss 区之后）——紧贴 bin 末尾会被内核 .bss 清零糊掉 */
     let info = unsafe { (kern as *mut u8).add(total - core::mem::size_of::<BootInfo>()) as *mut BootInfo };
     /* ── GetTime：Runtime Services @88，GetTime=第一个函数 @24（EFI_TIME 16B）── */
     let mut tm_year: u16 = 0; let mut tm_mon: u8 = 0; let mut tm_mday: u8 = 0;

@@ -10,12 +10,12 @@ __attribute__((aligned(8))) static u64 gdt[12] = {
     0x00AF9A000000FFFF,          // 1: kernel code  (0x08, DPL0, L=1)
     0x00CF92000000FFFF,          // 2: kernel data  (0x10, DPL0)
     0x00CFFA000000FFFF,          // 3: user code32 placeholder (0x18, DPL3; STAR base, never loaded)
-    0x00CFF20000FFFF,            // 4: user data Ring3 (0x20, DPL3) → sysret SS=0x23
+    0x00CFF2000000FFFF,            // 4: user data Ring3 (0x20, DPL3) → sysret SS=0x23
     0x00AFFA000000FFFF,          // 5: user code64 Ring3 (0x28, DPL3, L=1) → sysret CS=0x2B
     0x0000000000000000,          // 6: TSS low  (0x30) — filled in gdt_init
     0x0000000000000000,          // 7: TSS high
     0x00AFBA000000FFFF,          // 8: user code Ring1 (0x40, DPL1) — legacy, unused with sysret
-    0x00CFB20000FFFF,            // 9: user data Ring1 (0x48, DPL1)
+    0x00CFB2000000FFFF,            // 9: user data Ring1 (0x48, DPL1)
     0x0000000000000000,          // 10: spare
     0x0000000000000000           // 11: spare
 };
