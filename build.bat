@@ -29,6 +29,9 @@ echo Linking...
 ld.lld -T kernel.ld kernel/isr.o kernel/kernel.o kernel/hello.o kernel/exfat.o kernel/memdisk.o -o kernel/kernel.elf
 if %errorlevel% neq 0 (echo ERROR: link failed & pause & exit /b 1)
 llvm-objcopy -O binary kernel/kernel.elf kernel/kernel.kern
+echo Generating memdisk.img (ExFAT + KERNEL.BIN)...
+python tools\mkmemdisk.py
+if %errorlevel% neq 0 (echo ERROR: mkmemdisk failed - need Python 3 or image over 256KB & pause & exit /b 1)
 echo Building bootloader...
 cargo build --release --target x86_64-unknown-uefi
 if %errorlevel% neq 0 (echo ERROR: cargo build failed & pause & exit /b 1)
