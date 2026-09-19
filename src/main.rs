@@ -131,23 +131,29 @@ fn bsod(fb: usize, stride: u32, hr: u32, vr: u32) -> ! {
 #[repr(C)]
 struct BootInfo { fb_base: usize, fb_size: usize, hr: u32, vr: u32, stride: u32, px_fmt: u32, tm_year: u16, tm_mon: u8, tm_mday: u8, tm_hour: u8, tm_min: u8, tm_sec: u8 }
 
-/* 全局存 SystemTable——naked 入口存（rdx）——start_kernel 读——绕过 LLVM 寄存器传递（#GP 根因） */
+/* 全局存 SystemTable / ImageHandle——naked 入口存（rdx / rcx）——start_kernel 读——
+   绕过 LLVM 寄存器传递（#GP 根因）。rcx 必须存：ExitBootServices 第一个参数就是它 */
 static mut ST: usize = 0;
+static mut IH: usize = 0;
 
 #[no_mangle]
 #[unsafe(naked)]
 unsafe extern "efiapi" fn efi_main(_h: usize, _st: usize) -> usize {
-    /* naked：手动 prologue——MS x64 rdx=SystemTable——存到全局 ST——jmp start_kernel */
+    /* naked：手动 prologue——MS x64 rcx=ImageHandle、rdx=SystemTable——都存全局——jmp start_kernel */
     core::arch::naked_asm!(
         "lea rax, [rip + {st}]",
         "mov [rax], rdx",
+        "lea rax, [rip + {ih}]",
+        "mov [rax], rcx",
         "jmp start_kernel",
         st = sym ST,
+        ih = sym IH,
     )
 }
 #[no_mangle]
 fn start_kernel() -> ! {
     let st = unsafe { ST };
+    let ih = unsafe { IH };   /* ExitBootServices 要真 ImageHandle——不是 SystemTable */
     let bs = unsafe { *((st as *const u8).add(96) as *const *const u8) };   /* BootServices @0x60 (OVMF 布局——5730 正常版验证) */
     let lp: unsafe extern "efiapi" fn(*const u8,*const u8,*mut *mut u8)->usize =
         unsafe { core::mem::transmute(*((bs as *const u8).add(320) as *const *const u8)) };  /* LocateProtocol @320 */
@@ -224,26 +230,53 @@ fn start_kernel() -> ! {
 
 
     //
-    // // ── ExitBootServices: take control from firmware ──
-    // let mut map_sz: usize = 0;
-    // let mut map_key: usize = 0;
-    // let mut desc_sz: u32 = 0;
-    // let mut desc_ver: u32 = 0;
-    // let mmap: unsafe extern "efiapi" fn(*mut u8, *mut usize, *mut usize, *mut u32, *mut u32)->usize =
-    //     unsafe { core::mem::transmute(*((bs as *const u8).add(360) as *const *const u8)) };
-    // // first call: get required buffer size (EFI_BUFFER_TOO_SMALL expected)
-    // unsafe { mmap(core::ptr::null_mut(),&mut map_sz,&mut map_key,&mut desc_sz,&mut desc_ver); }
-    // // allocate buffer via AllocatePool (EfiLoaderData=1)
-    // let alloc_pool: unsafe extern "efiapi" fn(u32,usize,*mut *mut u8)->usize =
-    //     unsafe { core::mem::transmute(*((bs as *const u8).add(56) as *const *const u8)) };
-    // let mut map_buf: *mut u8 = core::ptr::null_mut();
-    // unsafe { alloc_pool(1, map_sz, &mut map_buf); }
-    // // second call: fill the map, get the real key
-    // unsafe { mmap(map_buf,&mut map_sz,&mut map_key,&mut desc_sz,&mut desc_ver); }
-    // // ExitBootServices (offset 104)
-    // let ebs: unsafe extern "efiapi" fn(usize,usize)->usize =
-    //     unsafe { core::mem::transmute(*((bs as *const u8).add(104) as *const *const u8)) };
-    // unsafe { ebs(st, map_key); }
+    /* ── ExitBootServices：从固件手里接管 ──
+       顺序（规范）：GetMemoryMap@56 探大小 → AllocatePages 分配缓冲 → 再取一次图拿真 MapKey
+       → ExitBootServices@232(ImageHandle, MapKey) + 有界重试 → cli → 跳内核。
+       约束：取图之后到 EBS 之间不能再有任何分配（否则 MapKey 作废、EBS 返回 EFI_INVALID_PARAMETER），
+       所以 memdisk 缓冲 / 内核 16MB / BootInfo / 这张图 的分配全都排在前面做完。
+       偏移是 EFI_BOOT_SERVICES 真实位置（Hdr 24B 起数）：GetMemoryMap=0x38、SignalEvent=0x68、
+       SetMem=0x168、ExitBootServices=0xE8 —— 之前误用的 360/56/104 分别是 SetMem/GetMemoryMap/SignalEvent。 */
+    let gmm: unsafe extern "efiapi" fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32)->usize =
+        unsafe { core::mem::transmute(*((bs as *const u8).add(56) as *const *const u8)) };
+    let ebs: unsafe extern "efiapi" fn(usize, usize)->usize =
+        unsafe { core::mem::transmute(*((bs as *const u8).add(232) as *const *const u8)) };
+    let mut map_sz: usize = 0; let mut map_key: usize = 0;
+    let mut desc_sz: usize = 0; let mut desc_ver: u32 = 0;
+    let mut map_pages: usize = 0; let mut map_buf: usize = 0;
+    let mut tries = 0;
+    loop {
+        if map_buf == 0 {
+            /* 探大小（返回 EFI_BUFFER_TOO_SMALL）→ 分配缓冲，留 8 个描述符余量 */
+            map_sz = 0;
+            unsafe { gmm(&mut map_sz, core::ptr::null_mut(), &mut map_key, &mut desc_sz, &mut desc_ver); }
+            uinfo_hex("map sz", map_sz); uinfo_hex("desc sz", desc_sz);
+            map_pages = (map_sz + 8 * desc_sz + 0xFFF) >> 12;
+            if map_pages == 0 { map_pages = 1; }
+            unsafe { ap(0, 2, map_pages, &mut map_buf); }
+            if map_buf == 0 { ucrit("mmap alloc fail"); bsod(mode.fb, stride, hr, vr); }
+            continue;
+        }
+        map_sz = map_pages << 12;
+        let r = unsafe { gmm(&mut map_sz, map_buf as *mut u8, &mut map_key, &mut desc_sz, &mut desc_ver) };
+        if r != 0 {
+            if r == 0x8000000000000005 {   /* BUFFER_TOO_SMALL：加大缓冲重来（EBS 还没调，允许分配）*/
+                map_pages = (map_sz + 0xFFF) >> 12; map_buf = 0; continue;
+            }
+            uinfo_hex("gmm ret", r); ucrit("GetMemoryMap fail"); bsod(mode.fb, stride, hr, vr);
+        }
+        uinfo_hex("map key", map_key);
+        let e = unsafe { ebs(ih, map_key) };   /* ★ 真 ImageHandle——不是 SystemTable */
+        if e == 0 { break; }
+        uinfo_hex("ebs ret", e);
+        tries += 1;
+        if tries > 8 { ucrit("EBS retries exhausted"); bsod(mode.fb, stride, hr, vr); }
+        /* MapKey 失效（这段时间内存图被改过）→ 重新取图再试，中间不再分配 */
+    }
+    uinfo("EBS OK");
+    /* EBS 已经拆掉固件定时器，但固件 IDT 还在——内核装上自己的 IDT/PIC 之前
+       有一段填满 4MB 显存的长循环，那段时间绝不能让中断落进固件处理程序 */
+    unsafe { core::arch::asm!("cli"); }
 
     uinfo_hex("tm_hour", tm_hour as usize); uinfo("jump kernel");
     unsafe { core::arch::asm!("mov rdi, {}", "call rax", in(reg) info, in("rax") kern, options(noreturn)); }
