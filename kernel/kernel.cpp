@@ -11,7 +11,9 @@
 #include "fs/exfat.h"
 #include "fs/nvme.h"
 
-struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec; };
+struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
+                  /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
+                  u32 ctrl_kind, pci_addr, part_lba, part_size; };
 
 IdtEntry idt[256];
 Fifo mfifo, kfifo;
@@ -250,6 +252,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
       __asm__ volatile("movq %%cr3, %0" : "=r"(cr3));
       __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
       char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] CR0=%x CR3=%x CR4=%x",(u32)cr0,(u32)cr3,(u32)cr4); out_file_str(dbg); }
+    /* 引导盘位置（引导器经 UEFI DevicePath 拿到的——不是猜的）：
+       kind: 1=ATA/IDE 2=SATA(AHCI) 3=NVMe 4=USB / pci = bus<<16|dev<<8|func */
+    { char dbg[96]; ksprintf(dbg,"[KERNEL/INFO] bootdev kind=%d pci=%x part_lba=%x part_sz=%x",
+        info->ctrl_kind, info->pci_addr, info->part_lba, info->part_size); out_file_str(dbg); }
     /* KERN_BASE = runtime address of _start — compute into LOCAL first!
        (KERN_BASE itself lives in BSS — the zeroing loop below would wipe it!) */
     u64 kb;

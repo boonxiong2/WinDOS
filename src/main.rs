@@ -22,12 +22,15 @@ fn loc_proto(st: usize, bs: usize, guid: &[u8;16], out: &mut *mut u8) -> usize {
     unsafe { lp(guid.as_ptr(), core::ptr::null(), out) }
 }
 /* SimpleFileSystem: OpenVolume @0; EFI_FILE_PROTOCOL: Open@0,Close@8,Read@0x18 */
-fn read_memdisk(st: usize, bs: usize, out_buf: *mut u8, max_len: usize) -> usize {
+fn read_memdisk(st: usize, bs: usize, devh: usize, out_buf: *mut u8, max_len: usize) -> usize {
     uinfo_hex("rm st", st); uinfo_hex("rm bs", bs);
     // LocateProtocol(SimpleFileSystem)
     let fs_guid: [u8;16] = [0x22,0x5b,0x4e,0x96,0x59,0x64,0xd2,0x11,0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b];
     let mut fs: *mut u8 = core::ptr::null_mut();
-    let lr = loc_proto(st, bs, &fs_guid, &mut fs);
+    /* 先试"我启动的那个卷"（LoadedImage.DeviceHandle 上的 FS 协议）——多盘机器才不会拿错盘 */
+    let mut lr = 0xFFFF_FFFFusize;
+    if devh != 0 { lr = handle_proto(bs, devh, &fs_guid, &mut fs); uinfo_hex("fs via devh", lr); }
+    if lr != 0 || fs.is_null() { lr = loc_proto(st, bs, &fs_guid, &mut fs); uinfo_hex("fs via locate", lr); }
     uinfo_hex("fs proto", fs as usize); uinfo_hex("fs lr", lr);
     if lr != 0 || fs.is_null() { ucrit("FS proto fail"); return 0; }
     // OpenVolume
@@ -60,6 +63,51 @@ fn read_memdisk(st: usize, bs: usize, out_buf: *mut u8, max_len: usize) -> usize
     uinfo_hex("memdisk read", sz);
     sz
 }
+/* ── 设备路径（DevicePath）解析：UEFI 已经知道"我从哪块盘来"，直接问到位置，不用猜 ── */
+const GUID_LOADED_IMAGE: [u8;16] = [0xa1,0x31,0x1b,0x5b,0x62,0x95,0xd2,0x11,0x8e,0x3f,0x00,0xa0,0xc9,0x69,0x72,0x3b];
+const GUID_DEVICE_PATH:  [u8;16] = [0x91,0x6e,0x57,0x09,0x3f,0x6d,0xd2,0x11,0x8e,0x39,0x00,0xa0,0xc9,0x69,0x72,0x3b];
+
+/* HandleProtocol @0x98(152)：取"某个句柄上"的协议（LocateProtocol 是取"任意一个"，多盘时会拿错） */
+fn handle_proto(bs: usize, h: usize, guid: &[u8;16], out: &mut *mut u8) -> usize {
+    let hp: unsafe extern "efiapi" fn(usize, *const u8, *mut *mut u8) -> usize =
+        unsafe { core::mem::transmute(*((bs as *const u8).add(152) as *const *const u8)) };
+    unsafe { hp(h, guid.as_ptr(), out) }
+}
+
+/* 遍历 DevicePath 节点 → (控制器类型, PCI bus<<16|dev<<8|func, 分区起始LBA, 分区扇区数)
+   类型：1=ATA/IDE 2=SATA(AHCI) 3=NVMe 4=USB 0=未知
+   节点格式：Type(1) SubType(1) Length(2) Data...
+     Hardware 0x01 / ACPI 0x02 : HID(4) UID(4)          → UID 即 PCI 总线号（PciRoot 惯例）
+     Hardware 0x01 / PCI  0x01 : Func(1) Dev(1)          → dev/func
+     Messaging 0x03 / 0x01 ATAPI / 0x10 SATA / 0x12 NVMe / 0x05 USB
+     Media 0x04 / HardDrive 0x01 : PartNum(4) PartStart(8) PartSize(8)  ← 分区位置就在这儿 */
+fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32) {
+    let mut kind = 0u32; let mut bus = 0u32; let mut dev = 0u32; let mut func = 0u32;
+    let mut plba = 0u32; let mut psz = 0u32; let mut seen_pci = false; let mut guard = 0;
+    let mut p = dp as usize;
+    loop {
+        guard += 1; if guard > 64 { break; }
+        let (t, st) = unsafe { (*(p as *const u8), *((p + 1) as *const u8)) };
+        let len = unsafe { *((p + 2) as *const u16) } as usize;
+        if len == 0 || t == 0x7f { break; }             /* End of Device Path */
+        if t == 0x01 && st == 0x02 {                    /* ACPI: HID, UID */
+            bus = unsafe { *((p + 8) as *const u32) };
+        } else if t == 0x01 && st == 0x01 {             /* PCI: Func, Dev */
+            func = unsafe { *(p as *const u8).add(4) } as u32;
+            dev  = unsafe { *(p as *const u8).add(5) } as u32;
+            seen_pci = true;
+        } else if t == 0x03 {                           /* Messaging */
+            kind = match st { 0x01 => 1, 0x10 => 2, 0x12 => 3, 0x05 => 4, _ => kind };
+        } else if t == 0x04 && st == 0x01 {             /* Media / HardDrive */
+            plba = (unsafe { *((p + 8)  as *const u64) }) as u32;
+            psz  = (unsafe { *((p + 16) as *const u64) }) as u32;
+        }
+        p += len;
+    }
+    let addr = if seen_pci { (bus << 16) | (dev << 8) | func } else { 0xFFFF_FFFF };
+    (kind, addr, plba, psz)
+}
+
 /* ExFAT 解析：从整盘镜像找 KERNEL.BIN，返回 (簇数据区指针, 长度) */
 fn exfat_find_kern(img: *const u8, total: usize) -> (usize, usize) {
     let b: &[u8] = unsafe { core::slice::from_raw_parts(img, total) };
@@ -129,7 +177,9 @@ fn bsod(fb: usize, stride: u32, hr: u32, vr: u32) -> ! {
     loop {}
 }
 #[repr(C)]
-struct BootInfo { fb_base: usize, fb_size: usize, hr: u32, vr: u32, stride: u32, px_fmt: u32, tm_year: u16, tm_mon: u8, tm_mday: u8, tm_hour: u8, tm_min: u8, tm_sec: u8 }
+struct BootInfo { fb_base: usize, fb_size: usize, hr: u32, vr: u32, stride: u32, px_fmt: u32, tm_year: u16, tm_mon: u8, tm_mday: u8, tm_hour: u8, tm_min: u8, tm_sec: u8,
+                   /* ── 引导盘位置（UEFI 给的，不是猜的）── */
+                   ctrl_kind: u32, pci_addr: u32, part_lba: u32, part_size: u32 }
 
 /* 全局存 SystemTable / ImageHandle——naked 入口存（rdx / rcx）——start_kernel 读——
    绕过 LLVM 寄存器传递（#GP 根因）。rcx 必须存：ExitBootServices 第一个参数就是它 */
@@ -154,7 +204,29 @@ unsafe extern "efiapi" fn efi_main(_h: usize, _st: usize) -> usize {
 fn start_kernel() -> ! {
     let st = unsafe { ST };
     let ih = unsafe { IH };   /* ExitBootServices 要真 ImageHandle——不是 SystemTable */
-    let bs = unsafe { *((st as *const u8).add(96) as *const *const u8) };   /* BootServices @0x60 (OVMF 布局——5730 正常版验证) */
+    let bs = unsafe { *((st as *const u8).add(96) as *const *const u8) };
+    /* ── 问 UEFI"我从哪块盘来"：LoadedImage.DeviceHandle = 加载我的设备；
+       DevicePath 里直接带 控制器类型 / PCI bus-dev-func / 分区起始 LBA + 扇区数。
+       这样内核不用猜盘、不用扫 PCI、也不用把 QEMU 的 BAR/vid 写死。 ── */
+    let mut devh: usize = 0;
+    let mut ctrl_kind: u32 = 0; let mut pci_addr: u32 = 0xFFFF_FFFF;
+    let mut part_lba: u32 = 0; let mut part_size: u32 = 0;
+    {
+        let mut li: *mut u8 = core::ptr::null_mut();
+        let lir = handle_proto(bs as usize, ih, &GUID_LOADED_IMAGE, &mut li);
+        if lir == 0 && !li.is_null() {
+            devh = unsafe { *((li as *const u8).add(24) as *const usize) };   /* DeviceHandle @24 */
+            uinfo_hex("dev handle", devh);
+            let mut dp: *mut u8 = core::ptr::null_mut();
+            if handle_proto(bs as usize, devh, &GUID_DEVICE_PATH, &mut dp) == 0 && !dp.is_null() {
+                let (k, a, l, s) = parse_dp(dp as *const u8);
+                ctrl_kind = k; pci_addr = a; part_lba = l; part_size = s;
+                uinfo_hex("ctrl kind", k as usize);   /* 1=ATA/IDE 2=SATA 3=NVMe 4=USB 0=? */
+                uinfo_hex("pci addr", a as usize);    /* bus<<16 | dev<<8 | func */
+                uinfo_hex("part lba", l as usize); uinfo_hex("part sz", s as usize);
+            } else { ucrit("DevicePath fail"); }
+        } else { ucrit("LoadedImage fail -> LocateProtocol 兜底"); }
+    }   /* BootServices @0x60 (OVMF 布局——5730 正常版验证) */
     let lp: unsafe extern "efiapi" fn(*const u8,*const u8,*mut *mut u8)->usize =
         unsafe { core::mem::transmute(*((bs as *const u8).add(320) as *const *const u8)) };  /* LocateProtocol @320 */
     let guid: [u8;16] = [0xde,0xa9,0x42,0x90,0xdc,0x23,0x38,0x4a,0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a];
@@ -196,7 +268,7 @@ fn start_kernel() -> ! {
     unsafe { ap(0,2,mb_total>>12,&mut mb_buf); }
     uinfo_hex("mb buf", mb_buf);
     if mb_buf == 0 { ucrit("memdisk alloc fail"); bsod(mode.fb, stride, hr, vr); }
-    let md_sz = read_memdisk(st, bs as usize, mb_buf as *mut u8, mb_total);
+    let md_sz = read_memdisk(st, bs as usize, devh, mb_buf as *mut u8, mb_total);
     if md_sz == 0 { ucrit("memdisk read fail"); bsod(mode.fb, stride, hr, vr); }
     let (kern_src, kern_len) = exfat_find_kern(mb_buf as *const u8, md_sz);
     uinfo_hex("kern src", kern_src); uinfo_hex("kern len", kern_len);
@@ -226,7 +298,7 @@ fn start_kernel() -> ! {
             tm_mon = tm[2]; tm_mday = tm[3]; tm_hour = tm[4]; tm_min = tm[5]; tm_sec = tm[6];
         }
     }
-    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec }; }
+    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec, ctrl_kind, pci_addr, part_lba, part_size }; }
 
 
     //
