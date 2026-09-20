@@ -29,21 +29,7 @@ static void *xmemset(void *d, int v, unsigned long n) {
 #define strcmp xstrcmp
 #define memset xmemset
 
-/* 内存盘测试模式：从嵌入的 memdisk 数组读扇区（验证 fs 解析逻辑——
-   不依赖 QEMU 的 IDE/NVMe 玄学）。实体盘驱动（IDE/NVMe）后续换环境再试。 */
-extern "C" unsigned char memdisk[];
-extern "C" const unsigned int memdisk_size;
-static int mem_read_sector(int ch, int dv, u32 lba, u32 count, u8 *buf) {
-    (void)ch; (void)dv;
-    u64 off = (u64)lba * 512;
-    for (u32 i = 0; i < count; i++) {
-        if (off + 512 > memdisk_size) return -1;
-        memcpy(buf + i * 512, memdisk + off, 512);
-        off += 512;
-    }
-    return 0;
-}
-#define ide_read_sector mem_read_sector   /* 测试期：内存盘替代 IDE */
+/* 真盘读写：走 ata.h 的 ATA PIO（不再用内存盘宏顶替——那只是解析逻辑的测试替身） */
 
 /* 分区起始 LBA 由 MBR 分区表解析得到（不再硬编码——diskpart 的
    MBR 分区从 LBA 128 起，GPT 从 2048 起——必须解析） */
@@ -55,6 +41,17 @@ static u32  g_bps, g_spc, g_bpc;   /* 每扇区/每簇字节、每簇扇区 */
 static u8 g_tmp[8192];             /* 临时簇缓冲（最大 8KB——16 扇区/簇） */
 static u32 g_part_lba = 0;            /* 分区起始 LBA（MBR 解析） */
 static int g_ch = 0, g_dv = 0;      /* 探测到的盘位（通道×主从） */
+
+/* 引导盘位置由引导器经 UEFI DevicePath 问到并传进来：
+   控制器类型 / 通道 / 盘位 / 分区起始 LBA——内核不再猜盘、不再暴力试 4 个位置。
+   未设置或类型不支持时，回退到原来的暴力探测。 */
+static int g_dev_forced = 0;
+void exfat_set_dev(u32 ctrl_kind, u32 ch, u32 dv, u32 part_lba, u32 part_size) {
+    (void)part_size;
+    if (ctrl_kind == 1 && ch <= 1 && dv <= 1 && part_lba != 0) {  /* 1 = ATA/IDE（端口 0x1F0/0x170）*/
+        g_ch = (int)ch; g_dv = (int)dv; g_part_lba = part_lba; g_dev_forced = 1;
+    }
+}
 
 /* ---- 簇 → LBA（★ 簇号从 2 开始——原版漏了 -2！）---- */
 static u32 cluster_to_lba(u32 cluster)
@@ -215,12 +212,21 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
     }
     if (free_cluster == 0) return -1;   /* 满盘 */
 
-    /* 3. 写数据进簇（memdisk 数组可写——"放书"） */
-    memcpy((u8*)memdisk + (u64)cluster_to_lba(free_cluster) * 512, data, (u32)size);
+    /* 3. 写数据进簇（真盘：按扇区读-改-写——小文件不破坏同扇区的其它数据） */
+    {
+        u32 lba0 = cluster_to_lba(free_cluster);
+        u8 sec[512];
+        for (u32 o = 0; o < (u32)size; o += 512) {
+            u32 n = (u32)size - o; if (n > 512) n = 512;
+            if (ide_read_sector(g_ch, g_dv, lba0 + o / 512, 1, sec) != 0) return -2;
+            memcpy(sec, data + o, n);
+            if (ide_write_sector(g_ch, g_dv, lba0 + o / 512, 1, sec) != 0) return -3;
+        }
+    }
 
     /* 4. 位图置 1 + 写回（"房间标记已用"） */
     bm[free_cluster / 8] |= (u8)(1 << (free_cluster % 8));
-    memcpy((u8*)memdisk + (u64)cluster_to_lba(bm_cluster) * 512, bm, 512);
+    if (ide_write_sector(g_ch, g_dv, cluster_to_lba(bm_cluster), 1, bm) != 0) return -4;   /* 真盘写位图 */
 
     /* 5. 目录加条目组（0x85 文件 + 0xC0 流 + 0xC1 名字——"登记卡"） */
     u32 off = 0;
@@ -242,8 +248,11 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
         rd_buf[off + 64 + 2 + i * 2 + 1] = 0;
     }
     rd_buf[off + 96] = 0x00;                         /* 新 EOD */
-    /* 目录簇写回 */
-    memcpy((u8*)memdisk + (u64)cluster_to_lba(2) * 512, rd_buf, g_bpc);
+    /* 目录簇写回（真盘） */
+    {
+        u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
+        if (ide_write_sector(g_ch, g_dv, cluster_to_lba(2), dn, rd_buf) != 0) return -5;
+    }
     return 0;
 }
 
@@ -255,6 +264,13 @@ int exfat_init(void)
     /* 自动探测盘位：试 4 个组合（Primary/Secondary × master/slave）——
        读 MBR（LBA 0）→ 解析第一分区起始 → 读分区引导扇区验 EXFAT 签名 */
     int found = 0;
+    if (g_dev_forced) {
+        /* UEFI 给的位置：只验这一个点（读分区引导扇区确认 EXFAT 签名）*/
+        if (ide_read_sector(g_ch, g_dv, g_part_lba, 1, buf) == 0
+            && buf[3]=='E'&&buf[4]=='X'&&buf[5]=='F'&&buf[6]=='A'&&buf[7]=='T'
+            && buf[510]==0x55 && buf[511]==0xAA) found = 1;
+        else return -3;   /* 位置已知但验不过——不再瞎试其它盘位（错盘比慢更糟）*/
+    }
     for (int ch = 0; ch <= 1 && !found; ch++) {
         for (int dv = 0; dv <= 1 && !found; dv++) {
             if (ide_read_sector(ch, dv, 0, 1, mbr) != 0) continue;

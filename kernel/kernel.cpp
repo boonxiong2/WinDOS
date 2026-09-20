@@ -9,11 +9,12 @@
 #include "sys/panic.h"
 #include "build_info.h"   /* build.bat 生成——编译时间戳 */
 #include "fs/exfat.h"
+#include "fs/ata.h"     /* ATA PIO 真盘读写（引导盘位置来自 BootInfo）*/
 #include "fs/nvme.h"
 
 struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
                   /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
-                  u32 ctrl_kind, pci_addr, part_lba, part_size; };
+                  u32 ctrl_kind, pci_addr, part_lba, part_size; u32 ata_ch, ata_dv; };
 
 IdtEntry idt[256];
 Fifo mfifo, kfifo;
@@ -254,8 +255,66 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
       char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] CR0=%x CR3=%x CR4=%x",(u32)cr0,(u32)cr3,(u32)cr4); out_file_str(dbg); }
     /* 引导盘位置（引导器经 UEFI DevicePath 拿到的——不是猜的）：
        kind: 1=ATA/IDE 2=SATA(AHCI) 3=NVMe 4=USB / pci = bus<<16|dev<<8|func */
-    { char dbg[96]; ksprintf(dbg,"[KERNEL/INFO] bootdev kind=%d pci=%x part_lba=%x part_sz=%x",
-        info->ctrl_kind, info->pci_addr, info->part_lba, info->part_size); out_file_str(dbg); }
+    { char dbg[112]; ksprintf(dbg,"[KERNEL/INFO] bootdev kind=%d pci=%x part_lba=%x part_sz=%x ch=%d dv=%d",
+        info->ctrl_kind, info->pci_addr, info->part_lba, info->part_size, info->ata_ch, info->ata_dv); out_file_str(dbg); }
+    /* ── ATA 真盘读取自检：用 UEFI 给的位置直接读分区引导扇区，
+       看状态位与签名（"EXFAT"/"FAT16/32" + 0xAA55）——证明 PIO 真能读写 ── */
+    {
+        static u8 sec0[512];
+        u16 base = info->ata_ch ? 0x170 : 0x1F0;
+        u8 st0 = in8(base + 7);
+        int rr = ide_read_sector((int)info->ata_ch, (int)info->ata_dv, info->part_lba, 1, sec0);
+        u8 st1 = in8(base + 7);
+        char dbg[160];
+        ksprintf(dbg, "[KERNEL/INFO] ATAread ch=%d dv=%d lba=%x st=%x->%x ret=%d oem=%x%x%x%x%x%x%x%x aa55=%x%x",
+            (int)info->ata_ch, (int)info->ata_dv, info->part_lba, st0, st1, rr,
+            sec0[3],sec0[4],sec0[5],sec0[6],sec0[7],sec0[8],sec0[9],sec0[10], sec0[510], sec0[511]);
+        out_file_str(dbg);
+        /* ── 日志盘：按【内容签名】识别，不看盘位顺序（换个机器换根线照样能找到）── */
+        static u8 sig[512], wbuf[512], rbuf[512];
+        int lch = -1, ldv = -1;
+        for (int ch = 0; ch <= 1 && lch < 0; ch++)
+            for (int dv = 0; dv <= 1 && lch < 0; dv++) {
+                if (ch == (int)info->ata_ch && dv == (int)info->ata_dv) continue;   /* 跳过引导盘 */
+                if (ide_read_sector(ch, dv, 0, 1, sig) != 0) continue;
+                if (sig[0]=='W'&&sig[1]=='I'&&sig[2]=='N'&&sig[3]=='D'&&sig[4]=='B'&&sig[5]=='G'&&sig[6]=='0'&&sig[7]=='1')
+                    { lch = ch; ldv = dv; }
+            }
+        if (lch >= 0) {
+            for (int i = 0; i < 512; i++) wbuf[i] = 0;
+            wbuf[0]=0xAA; wbuf[1]=0x55; wbuf[2]='L'; wbuf[3]='O'; wbuf[4]='G';
+            int wr = ide_write_sector(lch, ldv, 1, 1, wbuf);
+            int r2 = ide_read_sector(lch, ldv, 1, 1, rbuf);
+            int ok = (r2 == 0 && rbuf[0]==0xAA && rbuf[1]==0x55 && rbuf[2]=='L' && rbuf[3]=='O' && rbuf[4]=='G');
+            ksprintf(dbg, "[KERNEL/INFO] logdisk ch=%d dv=%d wr=%d rd=%d %s",
+                     lch, ldv, wr, r2, ok ? "WRITE_OK" : "WRITE_FAIL");
+            out_file_str(dbg);
+        } else {
+            out_file_str("[KERNEL/INFO] logdisk: no WINDBG01 signature on any drive");
+        }
+        /* ── ATA 端口自检：写 LBA 寄存器再读回 + IDENTIFY 状态采样 + PCI 配置 ── */
+        {
+            u32 cmdi = pci_read(0,1,1,0x04), clsi = pci_read(0,1,1,0x08);
+            u32 pb0 = pci_read(0,1,1,0x10), pb1 = pci_read(0,1,1,0x14);
+            u32 pb2 = pci_read(0,1,1,0x18), pb3 = pci_read(0,1,1,0x1C);
+            ksprintf(dbg, "[KERNEL/INFO] ide pci cmd=%x cls=%x progif=%x bar=%x,%x,%x,%x",
+                     cmdi, clsi, (clsi >> 8) & 0xFF, pb0, pb1, pb2, pb3);
+            out_file_str(dbg);
+            u8 r1, r2;
+            out8(0x173, 0x5A); r1 = in8(0x173);
+            out8(0x173, 0xA5); r2 = in8(0x173);
+            ksprintf(dbg, "[KERNEL/INFO] ata port chk lba_lo reg: 5A->%x  A5->%x  st=%x alt=%x",
+                     r1, r2, in8(0x177), in8(0x376));
+            out_file_str(dbg);
+            /* IDENTIFY(0xEC) 到二级主盘：选盘 → 采样状态 */
+            out8(0x176, 0xA0); for (int i = 0; i < 4; i++) in8(0x177);
+            out8(0x172, 0); out8(0x173, 0); out8(0x174, 0); out8(0x175, 0);
+            out8(0x177, 0xEC);
+            ksprintf(dbg, "[KERNEL/INFO] ata ident st: %x %x %x %x err=%x",
+                     in8(0x177), in8(0x177), in8(0x177), in8(0x177), in8(0x171));
+            out_file_str(dbg);
+        }
+    }
     /* KERN_BASE = runtime address of _start — compute into LOCAL first!
        (KERN_BASE itself lives in BSS — the zeroing loop below would wipe it!) */
     u64 kb;
@@ -462,47 +521,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     /* ── ExFAT 测试：初始化 + 列根目录（fs/exfat.cpp——QEMU 第二块盘）── */
     LOG_INFO("[FS] exfat-test enter");
     {
-        /* ATA 诊断：Secondary 通道状态（0x177）——0xFF=无盘，0x50/0x58=盘就绪 */
-        char adbg[64];
-        u8 ast = in8(0x177);
-        ksprintf(adbg, "[FS] ATA Sec st=%x\n", ast);
-        out_file_str(adbg);
-        u8 ast2 = in8(0x1F7);
-        ksprintf(adbg, "[FS] ATA Pri st=%x\n", ast2);
-        out_file_str(adbg);
-        /* 错误寄存器（0x171 Secondary / 0x1F1 Primary）：ABRT=bit2 IDNF=bit4 */
-        u8 aerr = in8(0x171);
-        ksprintf(adbg, "[FS] ATA Sec err=%x\n", aerr);
-        out_file_str(adbg);
-        /* 手动 ATA 读 Primary LBA 0（master 0xE0 和 slave 0xF0——诊断） */
-        {
-            out8(0x3F6, 0x02);   /* SRST：软件复位 */
-            for (volatile int d2 = 0; d2 < 100000; d2++);
-            out8(0x3F6, 0x00);   /* 复位完成（nIEN 清） */
-            for (volatile int d2 = 0; d2 < 100000; d2++);
-            LOG_INFO("[FS] ATA manual-read");
-            for (int dv = 0; dv <= 2; dv++) {   /* 0=master读 1=slave读 2=slave IDENTIFY */
-                int sel = (dv == 2) ? 1 : dv;
-                out8(0x1F6, sel ? 0xF0 : 0xE0);   /* 选盘 */
-                for (volatile int d2 = 0; d2 < 10000; d2++);   /* 选盘后延时 */
-                out8(0x1F2, 1);
-                out8(0x1F3, 0); out8(0x1F4, 0); out8(0x1F5, 0);
-                u8 cmd = (dv == 2) ? 0xEC : 0x20;   /* dv=2 → IDENTIFY */
-                out8(0x1F7, cmd);
-                int got = 0;
-                u8 st3 = 0;
-                for (volatile int dly = 0; dly < 2000; dly++) {   /* 忙等减到 2k 次——QEMU IDE 无盘 DRQ 不置位——原 5M 次 volatile 端口读卡死(freeze) */
-                    st3 = in8(0x1F7);
-                    if (st3 & 0x08) { got = 1; break; }   /* DRQ */
-                    if (st3 & 0x01) break;                /* 错误 */
-                }
-                u8 er3 = in8(0x1F1);
-                u16 first = (st3 & 0x08) ? (u16)(in8(0x1F0) | (in8(0x1F0) << 8)) : 0;
-                ksprintf(adbg, "[FS] P dv=%d cmd=%x got=%d st=%x err=%x data=%x\n", dv, cmd, got, st3, er3, first);
-                out_file_str(adbg);
-            }
-        }
         LOG_INFO("[FS] exfat_init call");
+        exfat_set_dev(info->ctrl_kind, info->ata_ch, info->ata_dv, info->part_lba, info->part_size);
         int r = exfat_init();
         LOG_INFO("[FS] exfat_init done");
         /* ── QEMU 检测：CPUID hypervisor leaf 0x40000000
@@ -518,11 +538,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             char ndbg[64];
             ksprintf(ndbg, "[CPU] hypervisor=\"%s\" qemu=%d\n", hv, q);
             out_file_str(ndbg);
-            /* ① IDE 特殊处理：QEMU 的 IDE PIO 模拟有坑（DRQ 永不置位——
-               十几轮诊断确认）——标注环境，后续走 NVMe */
-            if (q) {
-                out_file_str("[FS] QEMU env: IDE PIO known-broken, using NVMe\n");
-            }
+            (void)q;   /* 之前这里写"QEMU IDE PIO 损坏"——真凶是 io.h 端口读非 volatile
+                          被 -O2 提升（已修）：ATA PIO 读写现在实测正常 */
         }
         /* ── NVMe 探测：PCI 枚举打印（bus 0 所有 dev 的 vid/class——诊断）── */
         {

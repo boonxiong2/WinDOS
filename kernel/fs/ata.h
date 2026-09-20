@@ -6,7 +6,7 @@
 #include "../boot/types.h"
 #include "../drivers/io.h"
 
-static inline u16 in16(u16 p) { u16 v; __asm__("inw %1,%0":"=a"(v):"dN"(p)); return v; }
+static inline u16 in16(u16 p) { u16 v; __asm__ volatile("inw %1,%0":"=a"(v):"dN"(p):"memory"); return v; }
 
 /* 等待磁盘不忙（BSY 清）——channel 选端口 */
 static inline int ata_wait_bsy(int channel) {
@@ -47,6 +47,41 @@ static inline int ide_read_sector(int channel, int drive, u32 lba, u32 count, u8
             buf[s * 512 + i * 2]     = v & 0xFF;
             buf[s * 512 + i * 2 + 1] = v >> 8;
         }
+        lba++;
+    }
+    return 0;
+}
+
+/* 写扇区（LBA28，命令 0x30）——流程与读对称：
+   等 BSY 清 → 选盘 → 写数量/LBA → 命令 0x30 → 等 DRQ → 写 256×u16 → 等 BSY → FLUSH(0xE7) */
+static inline int ide_write_sector(int channel, int drive, u32 lba, u32 count, const u8 *buf) {
+    u16 base = channel ? 0x170 : 0x1F0;
+    u16 data = base, stat = base + 7, drv = base + 6;
+    u16 sct = base + 2, lbal = base + 3, lbam = base + 4, lbah = base + 5;
+    for (u32 s = 0; s < count; s++) {
+        if (ata_wait_bsy(channel) != 0) return -1;
+        out8(drv, (drive ? 0xF0 : 0xE0) | ((lba >> 24) & 0x0F));
+        for (int i = 0; i < 4; i++) in8(stat);   /* 选盘后读 4 次——状态稳定 */
+        out8(sct, 1);
+        out8(lbal, lba & 0xFF);
+        out8(lbam, (lba >> 8) & 0xFF);
+        out8(lbah, (lba >> 16) & 0xFF);
+        out8(stat, 0x30);                        /* WRITE SECTOR(S) */
+        int got = 0;
+        for (int i = 0; i < 1000000; i++) {
+            u8 st = in8(stat);
+            if (st & 0x08) { got = 1; break; }   /* DRQ */
+            if (st == 0 || st == 0xFF) return -2;
+            if (st & 0x01) return -3;
+        }
+        if (!got) return -4;
+        for (int i = 0; i < 256; i++) {
+            u16 v = (u16)buf[s * 512 + i * 2] | ((u16)buf[s * 512 + i * 2 + 1] << 8);
+            __asm__ volatile("outw %0, %1" :: "a"(v), "dN"(data) : "memory");
+        }
+        if (ata_wait_bsy(channel) != 0) return -5;
+        out8(stat, 0xE7);                        /* FLUSH CACHE */
+        if (ata_wait_bsy(channel) != 0) return -6;
         lba++;
     }
     return 0;

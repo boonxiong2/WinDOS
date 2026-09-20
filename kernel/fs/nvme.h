@@ -7,8 +7,8 @@
 #include "../drivers/io.h"
 
 /* ---- 32 位端口 I/O（io.h 只有 8 位——补） ---- */
-static inline u32 inl(u16 p) { u32 v; __asm__("inl %1,%0":"=a"(v):"dN"(p)); return v; }
-static inline void outl(u16 p, u32 v) { __asm__("outl %0,%1"::"a"(v),"dN"(p)); }
+static inline u32 inl(u16 p) { u32 v; __asm__ volatile("inl %1,%0":"=a"(v):"dN"(p):"memory"); return v; }
+static inline void outl(u16 p, u32 v) { __asm__ volatile("outl %0,%1"::"a"(v),"dN"(p):"memory"); }
 
 /* ---- PCI 配置空间访问 ---- */
 static inline u32 pci_read(u8 bus, u8 dev, u8 fn, u8 reg) {

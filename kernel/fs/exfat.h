@@ -46,6 +46,7 @@ struct EXFAT_FILE_INFO {
 };
 
 /* ---- API ---- */
+void exfat_set_dev(u32 ctrl_kind, u32 ch, u32 dv, u32 part_lba, u32 part_size);  /* 引导器给的盘位置 */
 int  exfat_init(void);       /* 读引导扇区 + 解析参数（先验 "EXFAT"） */
 int  exfat_list_dir(u32 dir_cluster, struct EXFAT_FILE_INFO *out, int max);
 int  exfat_find(u32 dir_cluster, const char *fname, struct EXFAT_FILE_INFO *out);

@@ -81,8 +81,9 @@ fn handle_proto(bs: usize, h: usize, guid: &[u8;16], out: &mut *mut u8) -> usize
      Hardware 0x01 / PCI  0x01 : Func(1) Dev(1)          → dev/func
      Messaging 0x03 / 0x01 ATAPI / 0x10 SATA / 0x12 NVMe / 0x05 USB
      Media 0x04 / HardDrive 0x01 : PartNum(4) PartStart(8) PartSize(8)  ← 分区位置就在这儿 */
-fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32) {
+fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32, u32, u32) {
     let mut kind = 0u32; let mut bus = 0u32; let mut dev = 0u32; let mut func = 0u32;
+    let mut ach = 0u32; let mut adv = 0u32;   /* ATA 通道/盘位（仅 ATAPI 节点有）*/
     let mut plba = 0u32; let mut psz = 0u32; let mut seen_pci = false; let mut guard = 0;
     let mut p = dp as usize;
     loop {
@@ -97,6 +98,10 @@ fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32) {
             dev  = unsafe { *(p as *const u8).add(5) } as u32;
             seen_pci = true;
         } else if t == 0x03 {                           /* Messaging */
+            if st == 0x01 {                             /* ATAPI: PrimarySecondary(1) SlaveMaster(1) Lun(2) */
+                ach = unsafe { *(p as *const u8).add(4) } as u32;   /* 0=Primary 1=Secondary */
+                adv = unsafe { *(p as *const u8).add(5) } as u32;   /* 0=Master  1=Slave  */
+            }
             kind = match st { 0x01 => 1, 0x10 => 2, 0x12 => 3, 0x05 => 4, _ => kind };
         } else if t == 0x04 && st == 0x01 {             /* Media / HardDrive */
             plba = (unsafe { *((p + 8)  as *const u64) }) as u32;
@@ -105,7 +110,7 @@ fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32) {
         p += len;
     }
     let addr = if seen_pci { (bus << 16) | (dev << 8) | func } else { 0xFFFF_FFFF };
-    (kind, addr, plba, psz)
+    (kind, addr, plba, psz, ach, adv)
 }
 
 /* ExFAT 解析：从整盘镜像找 KERNEL.BIN，返回 (簇数据区指针, 长度) */
@@ -179,7 +184,7 @@ fn bsod(fb: usize, stride: u32, hr: u32, vr: u32) -> ! {
 #[repr(C)]
 struct BootInfo { fb_base: usize, fb_size: usize, hr: u32, vr: u32, stride: u32, px_fmt: u32, tm_year: u16, tm_mon: u8, tm_mday: u8, tm_hour: u8, tm_min: u8, tm_sec: u8,
                    /* ── 引导盘位置（UEFI 给的，不是猜的）── */
-                   ctrl_kind: u32, pci_addr: u32, part_lba: u32, part_size: u32 }
+                   ctrl_kind: u32, pci_addr: u32, part_lba: u32, part_size: u32, ata_ch: u32, ata_dv: u32 }
 
 /* 全局存 SystemTable / ImageHandle——naked 入口存（rdx / rcx）——start_kernel 读——
    绕过 LLVM 寄存器传递（#GP 根因）。rcx 必须存：ExitBootServices 第一个参数就是它 */
@@ -211,6 +216,7 @@ fn start_kernel() -> ! {
     let mut devh: usize = 0;
     let mut ctrl_kind: u32 = 0; let mut pci_addr: u32 = 0xFFFF_FFFF;
     let mut part_lba: u32 = 0; let mut part_size: u32 = 0;
+    let mut ata_ch: u32 = 0; let mut ata_dv: u32 = 0;
     {
         let mut li: *mut u8 = core::ptr::null_mut();
         let lir = handle_proto(bs as usize, ih, &GUID_LOADED_IMAGE, &mut li);
@@ -219,11 +225,13 @@ fn start_kernel() -> ! {
             uinfo_hex("dev handle", devh);
             let mut dp: *mut u8 = core::ptr::null_mut();
             if handle_proto(bs as usize, devh, &GUID_DEVICE_PATH, &mut dp) == 0 && !dp.is_null() {
-                let (k, a, l, s) = parse_dp(dp as *const u8);
+                let (k, a, l, s, c, d2) = parse_dp(dp as *const u8);
                 ctrl_kind = k; pci_addr = a; part_lba = l; part_size = s;
+                ata_ch = c; ata_dv = d2;
                 uinfo_hex("ctrl kind", k as usize);   /* 1=ATA/IDE 2=SATA 3=NVMe 4=USB 0=? */
                 uinfo_hex("pci addr", a as usize);    /* bus<<16 | dev<<8 | func */
                 uinfo_hex("part lba", l as usize); uinfo_hex("part sz", s as usize);
+                uinfo_hex("ata ch", c as usize); uinfo_hex("ata dv", d2 as usize);
             } else { ucrit("DevicePath fail"); }
         } else { ucrit("LoadedImage fail -> LocateProtocol 兜底"); }
     }   /* BootServices @0x60 (OVMF 布局——5730 正常版验证) */
@@ -298,7 +306,7 @@ fn start_kernel() -> ! {
             tm_mon = tm[2]; tm_mday = tm[3]; tm_hour = tm[4]; tm_min = tm[5]; tm_sec = tm[6];
         }
     }
-    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec, ctrl_kind, pci_addr, part_lba, part_size }; }
+    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec, ctrl_kind, pci_addr, part_lba, part_size, ata_ch, ata_dv }; }
 
 
     //
