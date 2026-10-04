@@ -40,8 +40,19 @@ extern "C" void isr21_handler() {
    先发特殊 EOI（0xA0,0x64 + 0x20,0x62——原版 haribote 的做法，
    普通 EOI 会清错 in-service 位导致 IRQ 卡住）
    然后读 0x64：bit5=1 才是鼠标数据（bit5=0 是键盘——留给 isr21） */
-#define SHADOW 16   /* 窗口阴影宽度（与 kernel.cpp 的 draw_win_shadow 一致——拖动/关闭判定要偏移） */
-#define CUR_H  32   /* 光标高（= 16 * kernel.cpp 的 UI_SCALE——改 UI_SCALE 时这里要同步） */
+/* ── 与 kernel.cpp 同步的 UI 常量（改一处就得两处一起改）──
+   SHADOW    : 窗口阴影带宽（draw_win_shadow）
+   UI_SCALE  : 窗口/字/光标的放大倍数（标题栏 24*UI_SCALE 高、关闭钮 16*UI_SCALE x 14*UI_SCALE）
+   CUR_H     : 光标高 = 16 * UI_SCALE（鼠标边界钳位用） */
+#ifndef SHADOW
+#define SHADOW 16
+#endif
+#ifndef UI_SCALE
+#define UI_SCALE 2
+#endif
+#ifndef CUR_H
+#define CUR_H (16 * UI_SCALE)
+#endif
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -63,12 +74,16 @@ extern "C" void isr2c_handler() {
                             if(pix!=(u32)0x00FF00FF){
                                 if(j<g_shtctl->top-1) sheet_updown(sht, g_shtctl->top-1);
                                 sheet_updown(g_cur_sht, g_shtctl->top);
-                                if(3<=x&&x<sht->bxsize-3&&3+SHADOW<=y&&y<21+SHADOW){
-                                    /* ★ 标题栏判定偏移 SHADOW（缓冲含阴影——标题栏在内容区 y+SHADOW 起） */
+                                /* ★ 两个偏移都要算：+SHADOW（缓冲含阴影带）且 ×UI_SCALE（窗口已放大）
+                                   标题栏：内容区 y 3..21、x 3..bxsize-3（源图坐标）→ 各乘 UI_SCALE 再 +SHADOW */
+                                if(3*UI_SCALE<=x&&x<sht->bxsize-3*UI_SCALE
+                                   &&3*UI_SCALE+SHADOW<=y&&y<21*UI_SCALE+SHADOW){
                                     g_mmx=g_mx; g_mmy=g_my; g_drag_sht=sht;
                                 }
-                                if(sht!=g_login_sht && sht->bxsize-SHADOW-21<=x&&x<sht->bxsize-SHADOW-5&&5+SHADOW<=y&&y<19+SHADOW){
-                                    /* ★ 关闭按钮判定偏移 SHADOW（按钮在缓冲 (w-21+SHADOW, 5+SHADOW) 起） */
+                                /* 关闭钮：源图 (w-21, 5) 起、16x14 → 放大后 (w-21*S, 5*S) 起、16*S x 14*S */
+                                if(sht!=g_login_sht
+                                   &&sht->bxsize-SHADOW-21*UI_SCALE<=x&&x<sht->bxsize-SHADOW-5*UI_SCALE
+                                   &&5*UI_SCALE+SHADOW<=y&&y<19*UI_SCALE+SHADOW){
                                     sheet_free(sht);
                                     g_mmx=-1; g_drag_sht=0;
                                     shtctl_refresh_all(g_shtctl);
