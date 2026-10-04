@@ -271,6 +271,38 @@ fn start_kernel() -> ! {
     
         }
     }
+    /* ── 选模式：优先 1920x1080 ──
+       只用"恰好等于"的目标尺寸——绝不选更大的：内核的 lm_map/back_buf 是按 1920*1080 开的，
+       选到 4K(3840x2160) 会越界写约 25MB（.bss 里后面全是别的变量）。
+       找不到就保持固件给的当前模式（bootloader 不改模式也能跑）。 */
+    {
+        let set_mode: unsafe extern "efiapi" fn(*mut u8, u32)->usize =
+            unsafe { core::mem::transmute(*((gop as *const u8).add(8) as *const *const u8)) };  /* SetMode @8 */
+        let max_mode = unsafe { *(mode_ptr as *const u32) };   /* Mode->MaxMode @0 */
+        uinfo_hex("max mode", max_mode as usize);
+        let mut i: u32 = 0;
+        while i < max_mode {
+            let mut isz: usize = 0; let mut ip: *mut u8 = core::ptr::null_mut();
+            if unsafe { qm(gop, i, &mut isz, &mut ip) } == 0 && !ip.is_null() {
+                let gi = unsafe { &*(ip as *const GopInfo) };
+                if gi.hr == 1920 && gi.vr == 1080 {
+                    uinfo_hex("set mode idx", i as usize);
+                    let r = unsafe { set_mode(gop, i) };
+                    uinfo_hex("set mode ret", r);
+                    break;
+                }
+            }
+            i += 1;
+        }
+        /* SetMode 成功后固件会就地更新 Mode 结构（含 Info 指针与 FrameBufferBase）——
+           这里重新读一次尺寸，失败就沿用原来的 hr/vr */
+        let inf2 = unsafe { *((mode_ptr as *const u8).add(8) as *const *const u8) };   /* Mode->Info @8 */
+        if !inf2.is_null() {
+            let gi = unsafe { &*(inf2 as *const GopInfo) };
+            if gi.hr != 0 && gi.vr != 0 { hr = gi.hr; vr = gi.vr; stride = gi.stride; }
+        }
+        uinfo_hex("final hr", hr as usize); uinfo_hex("final vr", vr as usize);
+    }
     let ap: unsafe extern "efiapi" fn(usize,u32,usize,*mut usize)->usize =
         unsafe { core::mem::transmute(*((bs as *const u8).add(40) as *const *const u8)) };
     /* ── 放 ExFAT：读 memdisk.img（UEFI 文件协议）→ ExFAT 解析 → KERNEL.BIN（不内嵌——引导小）── */
