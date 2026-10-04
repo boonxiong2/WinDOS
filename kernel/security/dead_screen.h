@@ -1,6 +1,7 @@
 /* dead_screen.h — A security screen when a problem has been detected in System level */
 #pragma once
 #include "../sys/stdkern.h"
+#include "../sys/draw.h"    /* fill_rect_c（带裁剪） */
 /* Win 风格蓝屏。Error = Windows 停止代码（如 KERNEL_EXCEPTION / PAGE_FAULT_IN_NONPAGED_AREA） */
 static void ds(const char *Error) {
     /* 崩溃处理程序自身必须安全，两条：
@@ -24,7 +25,7 @@ static void ds(const char *Error) {
                     && W > 0 && W <= 8192 && H > 0 && H <= 8192
                     && st >= W && st <= 8192;
         if (fb_ok) {
-            fill_screen(fb, st, W, H, 0x00000000);   /* Win11 风格：纯黑屏（"蓝屏"改黑了） */
+            fill_rect_c(fb, st, (int)W, (int)H, 0, 0, (int)W, (int)H, 0x00000000);   /* 带裁剪填充（兜底） */
             /* Win11 风格排版：标题 + 进度（未实现） + 停止代码 */
             put_str(fb, st, W/2-40 - 170, H/2, "Your device ran into a problem and needs to restart.", 0x00FFFFFF);
             char buf[160];

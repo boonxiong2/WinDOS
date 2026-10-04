@@ -6,6 +6,7 @@
  * 鼠标处理见 sys/isr.h（isr2c 中断内直接处理）
  * ============================================================ */
 #include "sys/stdkern.h"
+#include "sys/draw.h"    /* 带裁剪的 fill/blit/text（防越界写）+ 哨兵自检 */
 #include "sys/panic.h"
 #include "build_info.h"   /* build.bat 生成——编译时间戳 */
 #include "fs/exfat.h"
@@ -270,6 +271,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
       char dbg[64]; ksprintf(dbg,"[KERNEL/INFO] CR0=%x CR3=%x CR4=%x",(u32)cr0,(u32)cr3,(u32)cr4); out_file_str(dbg); }
     /* 引导盘位置（引导器经 UEFI DevicePath 拿到的——不是猜的）：
        kind: 1=ATA/IDE 2=SATA(AHCI) 3=NVMe 4=USB / pci = bus<<16|dev<<8|func */
+    /* 裁剪基元自检（哨兵法）：界外绘制不许碰到哨兵，界内绘制必须画上 */
+    { int st1 = draw_selftest(); char dbg[64];
+      ksprintf(dbg, "[KERNEL/INFO] [DRAW] selftest %s (r=%d)", st1 == 0 ? "PASS" : "FAIL", st1);
+      out_file_str(dbg); out_file_str("\n"); }
     { char dbg[112]; ksprintf(dbg,"[KERNEL/INFO] bootdev kind=%d pci=%x part_lba=%x part_sz=%x ch=%d dv=%d",
         info->ctrl_kind, info->pci_addr, info->part_lba, info->part_size, info->ata_ch, info->ata_dv); out_file_str(dbg); }
     /* ── ATA 真盘读取自检：用 UEFI 给的位置直接读分区引导扇区，
@@ -662,7 +667,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 tbuf[5] = 0;
                 for (int yy = 0; yy < 20; yy++) for (int xx = 0; xx < 56; xx++)
                     back_buf[(vr - 20 + yy) * hr + (hr - 56 + xx)] = 0x00000000;
-                put_str(back_buf, hr, hr - 52, vr - 14, tbuf, 0x00FFFFFF);
+                put_str_c(back_buf, hr, hr, vr, hr - 52, vr - 14, tbuf, 0x00FFFFFF);   /* 带裁剪：坐标来自 hr/vr */
                 sheet_refresh(sht_back, hr - 56, vr - 20, hr, vr);
             }
         }
