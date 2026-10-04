@@ -35,7 +35,7 @@ static const char cs[16][19] = {
     "boooooob//////////",
     "booooooob/////////",
     "boooooooob////////",
-    "booboobbbbb///////",
+    "booooobbbbb///////",
     "bobboob///////////",
     "bb/boob///////////",
     "b///boob//////////",
@@ -548,7 +548,9 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     LOG_INFO("[FS] exfat-test enter");
     {
         LOG_INFO("[FS] exfat_init call");
-        exfat_set_dev(info->ctrl_kind, info->ata_ch, info->ata_dv, info->part_lba, info->part_size);
+        /* 测试期：不指定盘位（ctrl_kind=0 → 不强制），让 exFAT 探测自己找 exFAT 卷
+           （引导卷是 FAT，会被跳过；会命中挂着的那块 exFAT 测试盘）*/
+        exfat_set_dev(0, 0, 0, 0, 0);
         int r = exfat_init();
         LOG_INFO("[FS] exfat_init done");
         /* ── QEMU 检测：CPUID hypervisor leaf 0x40000000

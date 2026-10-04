@@ -12,15 +12,41 @@
   - 其他用户登录 → Ring 3 会话 ✅
 
 ## Storage
-- [-] ExFAT 文件系统（fs/exfat.cpp 已写：Entry Set/UTF-16/MBR 分区解析——**未验证**：QEMU 的 IDE PIO 模拟 DRQ 永不置位）
-- [ ] NVMe 驱动（尝试中——QEMU nvme 已挂载，BAR0 探测未通（配置读 FFFFFFFF）——需页表映射 32GB + Admin/IO 队列 + PRP）
+- [+] 磁盘 I/O（ATA PIO）：真盘**读 + 写**已通 ✅
+  - 读：引导卷分区引导扇区 → `oem="MSWIN4.1"` + `aa55=55AA`（日志 `ATAread … ret=0`）
+  - 写：签名盘 `logdisk` 写扇区 + 读回校验 = `WRITE_OK`
+  - ⚠️ 旧结论"QEMU IDE PIO 已知损坏 / DRQ 永不置位"是**误判**——真凶是 `drivers/io.h` 的 `in8` 没有 `volatile`（详见 Bug Reports）
+- [-] ExFAT：**读**可用（Windows 格式化的 exFAT 测试盘实测 `[FS] exFAT init OK`）；**写**还不完整：
+  - 待补字段：0x85 项 `SecondaryCount` / `SetChecksum` / 属性位置（现错写在 byte 2-3，属性该在 byte 4-5）、0xC0 项 `NameHash` / `NoFatChain`
+  - 待补算法：exFAT 的 16 位"旋转右移 1 + 加"校验和（**不是 CRC32**），覆盖 (SecondaryCount+1)*32 字节、跳过自身 2 字节
+  - 待修：目录簇号写死 `2`（测试盘根簇=**5**，照原样会把分配位图当目录写坏）、`u8 bm[512]` 对 4KB 簇会**栈溢出**、只支持单簇（≤4KB）、只写根目录、位图只写 1 扇区、名字只取低字节（中文名乱）
+  - 测试台：`run_exfat_test.bat` + `exfat_test.vhd`(MBR) / `exfat_gpt_test.vhd`(GPT，均 16MB/4KB簇/卷标 WD*)；判据 = 关机后 `chkdsk X: /f` 干净 + 资源管理器能看到文件
+  - 目标：**用户自己实现**
+- [ ] GPT 支持：内核目前只解析 MBR（`*(u32*)(mbr+454)` = 第一分区 LBA）→ GPT 盘实测 `[FS] exFAT init FAIL r=-2`
+  - 现象：GPT 的 LBA0 是保护性 MBR（0xEE，指向 LBA1）→ 我们读 LBA1 拿到的是 GPT 头（无 EXFAT 签名）→ 安全失败（不写坏）
+  - 方案 A（推荐，已具备）：**不解析分区表**，直接用引导器 DevicePath 给的 `part_lba`（MBR/GPT 通吃）
+  - 方案 B（练习）：LBA1 查 `"EFI PART"` → 条目数组 `0x48/0x50/0x54` → 取 `StartingLBA@0x20`；⚠️ GUID 混合端序、写 GPT 要重算 header/数组 CRC32（`0x10`/`0x58`）
+- [ ] FAT32 读+写（引导卷就是 FAT；若日志要"拔盘在 Windows 里能看"，FAT32 比 exFAT 少一档复杂度：无校验和、无名字哈希）
+- [ ] 日志落盘（两条路：① 裸扇区 appender 写签名盘——最小、已验证可写；② exFAT 写文件——要给 Windows 看时才需要）
+- [ ] NVMe 驱动（`BAR0=FFFFFFFF` 的两个真因已查明：① `io.h` 非 volatile 污染 PCI 读（已修）② 只取低 32 位 BAR + `vid==0x1B36` 硬编码。PCI 读现已正常 → 值得重试一版 64 位 BAR）
 - [ ] 虚拟文件系统（VFS）层
 - [ ] RAM disk
+
+## Devices / USB
+- [ ] xHCI（USB）驱动：**目前完全没有 USB 栈**
+  - 启动时就插着 U 盘：能进内核（固件读的），但**内核自己读不了它**（USB 在 xHCI 后面，ATA PIO 够不到）
+  - 运行中插入：**完全无感**（无枚举/无热插拔/无中断；好在也不会崩——`g_ch/g_dv` 在启动时定死）
+  - 真机上更致命：多数笔记本**没有 PS/2**，USB 键鼠 = 唯一输入 → 没有 xHCI 就是"看不见也点不动"
+- [ ] 低成本半步：引导器用 UEFI `Block I/O` 协议枚举所有块设备（含 USB），把"有几块盘 / 各是什么类型 / 什么位置"写进 BootInfo —— 内核能用则用，不能用至少能**报出来**
+- [ ] 热插拔：需要驱动里做端口状态变化 + 重新枚举（AHCI 支持；xHCI 更复杂）
 
 ## Graphics
 - [-] 双缓冲渲染（区域刷新——事件驱动 + isr2c 统一处理）
 - [+] 窗口拖拽 ✅（isr2c 中断内直接处理——Windows 式自由出屏）
 - [-] 窗口关闭按钮（✅ 已做 closebtn——最小化/最大化未做）
+- [+] **UI 缩放**（`UI_SCALE=2` @FHD：字形/标题栏/关闭钮/鼠标光标全部 2×；登录窗按内容裁剪 560×150，不整窗等比撑开）
+- [+] 2D 基元带裁剪（`sys/draw.h`：`fill_rect_c`/`blit_c`/`put_str_cs` + **哨兵自检** `[DRAW] selftest PASS`）
+- [-] 还停在 1× 的部分：**任务栏（40px）+ 右下时钟**（一起上 `UI_SCALE`：40→80px、时钟字 16×32、重绘矩形同步）
 - [ ] 真彩色图标
 
 ## Input
@@ -35,7 +61,18 @@
   - Ring 3 ✅（sysret 降权 + syscall + 中断进出）
   - IOPL=0 + UMIP（CPUID 门控）✅——防 CIH 提权
   - syscall 指针校验 ✅（用户区限制）
+- [ ] 页表 US 位收紧（现在 0…`_bss_end` 全翻 `US=1`，**内核页也在内** → Ring3 能读内核内存）
+- [ ] IOMMU / VT-d（防 PCIe 设备的 DMA 攻击——雷电 / 热插拔显卡能直接读写内存）
 - [ ] 可加载驱动模块
+
+## 登录 / 账户
+- [-] 登录界面（Ring0 组件、不可关闭）✅；用户名 → Ring3 ✅
+- [ ] **密码框**（现在先留结构，以后加密码 = 填数据，不是改排版）
+  - 两行输入（Username / Password）+ **Tab 切焦点** + Enter 提交
+  - 密码回显 `*`；⚠️ **密码绝不能进串口日志**（现在 `[LOGIN] user='…'` 会把输入原样打出来，密码字段必须绕开）
+  - 存储来源待定：① 引导器读 ESP 上的 `users.cfg` 塞进 BootInfo（现成能力）② 内核自己读 FAT（还没驱动）③ 先硬编码（demo）
+  - 比对：存 hash + 盐、恒定时间；**定位是"防误入"，不是"防提权"**（要诚实标注）
+  - ⚠️ 前提：US 位现在翻到 `_bss_end`（含内核页）→ 见 System 一节，真要安全登录得先收紧
 
 ## Applications
 - [ ] 命令行终端（console）
@@ -46,6 +83,15 @@
 
 
 ## Bug Reports
+- **【已修】端口 I/O 被编译器优化（= "QEMU IDE PIO 损坏"的真凶）**
+  - 现象①：轮询 DRQ 永远超时（循环只读了一次）；②：PCI 配置读 6 次返回同一个值 `02800007`；③：写 LBA 寄存器后读回不对
+  - 根因：`drivers/io.h` 的 `in8` 带输出操作数却**没有 `volatile`` → clang -O2 当纯函数做 CSE / 提出循环
+    （`out8` 无输出操作数、按 GCC 规则隐含 volatile，才侥幸活下来）
+  - 修法：`in8/in16/inl/out8/out16/outl` 全部 `volatile` + `"memory"` clobber
+  - 判据：`ata port chk lba_lo reg: 5A->5A`、`ATAread … ret=0`（读到真 FAT 引导扇区）、`logdisk … WRITE_OK`
+  - 同一天修掉的同类问题：DevicePath Messaging 子类型表写错（`0x12=SATA`/`0x17=NVMe`，我们写成 `0x10/0x12`
+    → SATA 盘误报成 NVMe，q35 实测修后 `ctrl kind=0x2`）；窗口标题栏/关闭钮命中判定漏乘 `UI_SCALE`
+
 - **Backspace 黑影二次出现（login 叠在 WinDOS 窗口）**
   - 登录窗口（400x200 中央）叠在 WinDOS 窗口（200x120）上——重叠区两窗口半透明阴影叠加（合成减——每层加深）变黑影
   - Backspace 输入框清空刷新时阴影区重画 → 黑影二次出现
