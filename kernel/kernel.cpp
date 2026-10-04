@@ -499,7 +499,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     LOG_INFO("[login]3 draw_shadow");
     draw_win_shadow(login_wbuf, 400, 200, "WinDOS Login");   /* ★ 阴影窗口 */
     LOG_INFO("[login]4 put_str");
-    put_str(login_wbuf, 400+2*SHADOW, 20+SHADOW, 40+SHADOW, "Username:", 0x00CCCCCC);
+    put_str(login_wbuf, 400+2*SHADOW, 20+SHADOW, 40+SHADOW, "Username:", 0x00000000);   /* 标签黑字（与标题一致）——浅灰底上看得清 */
     for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+SHADOW+y)*(400+2*SHADOW)+(160+SHADOW+x)]=0x00101010;
     LOG_INFO("[login]5 alloc");
     struct SHEET *login_sht = sheet_alloc(&shtctl);
