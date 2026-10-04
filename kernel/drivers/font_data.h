@@ -274,3 +274,26 @@ static inline void put_char(u32 *fb, u32 stride, int x, int y, char c, u32 color
 static inline void put_str(u32 *fb, u32 stride, int x, int y, const char *s, u32 color) {
     while (*s) { put_char(fb, stride, x, y, *s++, color); x += 8; }
 }
+
+/* 缩放版：点阵最近邻放大（s=2 → 16x32 的字）。FHD 下用得上。
+   注意不要用 continue——本项目被 clang -O2 + continue 坑过（跳循环尾不递增 → 死循环） */
+static inline void put_char_s(u32 *fb, u32 stride, int x, int y, char c, u32 color, int s) {
+    if (s <= 1) { put_char(fb, stride, x, y, c, color); return; }
+    const u8 *g = font[(u8)c];
+    for (int dy = 0; dy < 16; dy++) {
+        u8 bits = g[dy];
+        int py = y + dy * s;
+        for (int dx = 0; dx < 8; dx++) {
+            if (bits & (0x80 >> dx)) {
+                int px = x + dx * s;
+                for (int sy = 0; sy < s; sy++) {
+                    u32 *row = fb + (u32)(py + sy) * stride + (u32)px;
+                    for (int sx = 0; sx < s; sx++) row[sx] = color;
+                }
+            }
+        }
+    }
+}
+static inline void put_str_s(u32 *fb, u32 stride, int x, int y, const char *s, u32 color, int scale) {
+    while (*s) { put_char_s(fb, stride, x, y, *s++, color, scale); x += 8 * scale; }
+}

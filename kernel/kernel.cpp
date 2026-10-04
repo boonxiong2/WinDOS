@@ -102,20 +102,32 @@ static void draw_win(u32 *buf, int w, int h, const char *title) {
    窗口内容不偏移；阴影围绕四边，从窗口边缘（0 距离）向外渐变淡出
    （近边深 α=0x50 → 外边 α=0——半透明——需要图层系统 alpha 混合） */
 #define SHADOW 16  /* 阴影边距（continue 坑已修——16 安全） */
+/* UI 缩放：FHD(1920x1080) 下窗口和字都太小 → 2×（点阵最近邻放大）。
+   跑 800x600 时把它设回 1 即可（缓冲区尺寸也跟着这个常量走） */
+#define UI_SCALE 2
+/* 登录窗口几何：字放大 2×（16x32）后按内容裁剪——不做整窗等比放大，否则太占屏 */
+#define LOGIN_W  560          /* 窗口内容宽 */
+#define LOGIN_H  150          /* 窗口内容高 */
+#define LOGIN_BX 176          /* 输入框（窗口坐标）x / y / 宽 / 高 */
+#define LOGIN_BY 56
+#define LOGIN_BW 360
+#define LOGIN_BH 40
 
-static void draw_win_shadow(u32 *buf, int w, int h, const char *title) {
+/* s = UI 缩放（1=原尺寸；FHD 下用 UI_SCALE=2：标题栏/关闭钮/标题字一起放大）
+   注：阴影带宽 SHADOW 不缩放（它同时被光标/拖拽/刷新联动引用，改动面太大） */
+static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
     int W = w + 2 * SHADOW, H = h + 2 * SHADOW;
     /* 内容区（居中——四周留阴影带）——原 draw_win 逻辑 */
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) buf[(y + SHADOW) * W + (x + SHADOW)] = 0x00C0C0C0;
-    for (int y = 0; y < 24; y++)
+    for (int y = 0; y < 24 * s; y++)
         for (int x = 0; x < w; x++)
-            buf[(y + SHADOW) * W + (x + SHADOW)] = (y < 2 || x < 2 || x >= w - 2) ? 0x00404040 : 0x00FFFFFF;
-    put_str(buf, W, 5 + SHADOW, 4 + SHADOW, title, 0x00000000);
-    for (int y = 0; y < 14; y++)
-        for (int x = 0; x < 16; x++) {
-            char p = closebtn[y][x];
-            buf[(5 + y + SHADOW) * W + (w - 21 + x + SHADOW)] = (p == '@') ? 0x00000000 : 0x00FFFFFF;
+            buf[(y + SHADOW) * W + (x + SHADOW)] = (y < 2 * s || x < 2 * s || x >= w - 2 * s) ? 0x00404040 : 0x00FFFFFF;
+    put_str_s(buf, W, 5 * s + SHADOW, 4 * s + SHADOW, title, 0x00000000, s);
+    for (int y = 0; y < 14 * s; y++)
+        for (int x = 0; x < 16 * s; x++) {
+            char p = closebtn[y / s][x / s];
+            buf[(5 * s + y + SHADOW) * W + (w - 21 * s + x + SHADOW)] = (p == '@') ? 0x00000000 : 0x00FFFFFF;
         }
     /* ★ 贴边投影：四边从窗口边缘（0 距离）向外渐变——近深 α=0x50 → 外 α=0
        CRITICAL: 不用 continue（clang -O2 会优化成跳循环尾不递增→死循环/E06——
@@ -409,8 +421,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
         LOG_INFO("STARTUP text");
             
     // ── 创建 "WinDOS" 演示窗口（带渐变阴影——合成：下层−depth×step）──
-    static u32 win_buf[(200+2*SHADOW)*(120+2*SHADOW)];
-    draw_win_shadow(win_buf, 200, 120, "WinDOS");
+    static u32 win_buf[(200*UI_SCALE+2*SHADOW)*(120*UI_SCALE+2*SHADOW)];
+    draw_win_shadow(win_buf, 200*UI_SCALE, 120*UI_SCALE, "WinDOS", UI_SCALE);
     LOG_INFO("STARTUP drawn");
     /* 背景图层（sht_back）——独立缓冲 back_buf（原版做法）：
        背景是最底图层（sid=0，map 里 0 就代表"桌面"）
@@ -433,7 +445,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     sht_back->vx0 = 0; sht_back->vy0 = 0;
     sheet_updown(sht_back, 0);
     struct SHEET *win_sht = sheet_alloc(&shtctl);
-    sheet_setbuf(win_sht, win_buf, 200 + 2 * SHADOW, 120 + 2 * SHADOW, COL_INV);
+    sheet_setbuf(win_sht, win_buf, 200*UI_SCALE + 2 * SHADOW, 120*UI_SCALE + 2 * SHADOW, COL_INV);
     win_sht->vx0 = 80 - SHADOW; win_sht->vy0 = 72 - SHADOW;
     LOG_INFO("STARTUP wadd");
     sheet_updown(win_sht, 1);
@@ -495,18 +507,19 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     LOG_INFO("[login]1 buf");
     static char login_buf[32]; int login_len = 0; int logged_in = 0;
     LOG_INFO("[login]2 wbuf");
-    static u32 login_wbuf[(400+2*SHADOW)*(200+2*SHADOW)];   /* ★ 带阴影（加大缓冲） */
+    static u32 login_wbuf[(LOGIN_W+2*SHADOW)*(LOGIN_H+2*SHADOW)];   /* ★ 带阴影（加大缓冲） */
     LOG_INFO("[login]3 draw_shadow");
-    draw_win_shadow(login_wbuf, 400, 200, "WinDOS Login");   /* ★ 阴影窗口 */
+    draw_win_shadow(login_wbuf, LOGIN_W, LOGIN_H, "WinDOS Login", UI_SCALE);   /* ★ 阴影窗口 */
     LOG_INFO("[login]4 put_str");
-    put_str(login_wbuf, 400+2*SHADOW, 20+SHADOW, 40+SHADOW, "Username:", 0x00000000);   /* 标签黑字（与标题一致）——浅灰底上看得清 */
-    for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+SHADOW+y)*(400+2*SHADOW)+(160+SHADOW+x)]=0x00101010;
+    put_str_s(login_wbuf, LOGIN_W+2*SHADOW, 24+SHADOW, LOGIN_BY+SHADOW+4, "Username:", 0x00000000, UI_SCALE);   /* 标签黑字（与输入框垂直居中对齐） */
+    for(int y=0;y<LOGIN_BH;y++)for(int x=0;x<LOGIN_BW;x++)
+        login_wbuf[(LOGIN_BY+SHADOW+y)*(LOGIN_W+2*SHADOW)+(LOGIN_BX+SHADOW+x)]=0x00101010;
     LOG_INFO("[login]5 alloc");
     struct SHEET *login_sht = sheet_alloc(&shtctl);
     LOG_INFO("[login]6 setbuf");
-    sheet_setbuf(login_sht, login_wbuf, 400 + 2 * SHADOW, 200 + 2 * SHADOW, COL_INV);
+    sheet_setbuf(login_sht, login_wbuf, LOGIN_W + 2 * SHADOW, LOGIN_H + 2 * SHADOW, COL_INV);
     LOG_INFO("[login]7 pos");
-    login_sht->vx0=hr/2-200-SHADOW; login_sht->vy0=vr/2-100-SHADOW;
+    login_sht->vx0=hr/2-LOGIN_W/2-SHADOW; login_sht->vy0=vr/2-LOGIN_H/2-SHADOW;
     LOG_INFO("[login]8 updown");
     sheet_updown(login_sht, 3);
     LOG_INFO("[login]9 shadow");
@@ -696,13 +709,16 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                         login_buf[login_len++]=s0;
                     }
                     /* 重画登录窗口里的输入框：先清空区域(黑)，再写当前输入内容 */
-                    for(int y=0;y<16;y++)for(int x=0;x<240;x++) login_wbuf[(40+y)*400+(160+x)]=0x00101010;
+                    /* 清输入框：偏移/步长必须与初始化那处一致
+                       （此前这里写成 (40+y)*400+(160+x)——少 SHADOW、步长也错 → 删不干净留残影） */
+                    for(int y=0;y<LOGIN_BH;y++)for(int x=0;x<LOGIN_BW;x++)
+                        login_wbuf[(LOGIN_BY+SHADOW+y)*(LOGIN_W+2*SHADOW)+(LOGIN_BX+SHADOW+x)]=0x00101010;
                     char line[40];
                     for(int i=0;i<login_len&&i<31;i++) line[i]=login_buf[i];
                     line[login_len>31?31:login_len]=0;
-                    put_str(login_wbuf, 400 + 2 * SHADOW, 160 + SHADOW, 40 + SHADOW, line, 0x00FFFFFF);
+                    put_str_s(login_wbuf, LOGIN_W + 2 * SHADOW, LOGIN_BX + 8 + SHADOW, LOGIN_BY + SHADOW + 4, line, 0x00FFFFFF, UI_SCALE);
                     io_cli();  /* 图层操作——不能被 isr2c 打断 */
-                    sheet_refresh(login_sht, 150 + SHADOW, 32 + SHADOW, 410 + SHADOW, 64 + SHADOW);   /* 内容偏移+SHADOW */
+                    sheet_refresh(login_sht, LOGIN_BX - 8 + SHADOW, LOGIN_BY - 8 + SHADOW, LOGIN_BX + LOGIN_BW + 8 + SHADOW, LOGIN_BY + LOGIN_BH + 8 + SHADOW);
                     io_sti();
                 }
             }
