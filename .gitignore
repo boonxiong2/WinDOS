@@ -11,3 +11,7 @@ uefi_rust/
 *.log
 *.tmp
 main.rs.txt
+cmake-build-debug/
+*.class
+*.vhd
+nvme64.img
