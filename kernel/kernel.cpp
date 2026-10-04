@@ -105,6 +105,9 @@ static void draw_win(u32 *buf, int w, int h, const char *title) {
 /* UI 缩放：FHD(1920x1080) 下窗口和字都太小 → 2×（点阵最近邻放大）。
    跑 800x600 时把它设回 1 即可（缓冲区尺寸也跟着这个常量走） */
 #define UI_SCALE 2
+/* 光标尺寸（源图 18x16，按 UI_SCALE 放大）——isr.h 里的边界钳位也要跟这个一致 */
+#define CUR_W (18 * UI_SCALE)
+#define CUR_H (16 * UI_SCALE)
 /* 登录窗口几何：字放大 2×（16x32）后按内容裁剪——不做整窗等比放大，否则太占屏 */
 #define LOGIN_W  560          /* 窗口内容宽 */
 #define LOGIN_H  150          /* 窗口内容高 */
@@ -452,17 +455,21 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     g_shadow_shts[g_shadow_cnt++] = win_sht;   /* ★ 注册阴影窗口——刷新联动 */
     LOG_INFO("STARTUP win");
 
-    // ── 创建鼠标光标图层（18x16 箭头）──
+    // ── 创建鼠标光标图层（源图 18x16 箭头 × UI_SCALE）──
     // cur_buf 先全填透明色(0x00FF00FF)，再把 cs 字符画写进去
-    // （b=黑色 o=白色，/ 保持透明）
-    static u8 cur_buf[18*16*4];
-    for(int i=0;i<18*16*4;i++){cur_buf[i]=0xFF;((u32*)cur_buf)[i/4]=0x00FF00FF;}
+    // （b=黑色 o=白色，/ 保持透明）；每个源像素铺成 UI_SCALE×UI_SCALE 块
+    static u8 cur_buf[CUR_W * CUR_H * 4];
+    for(int i=0;i<CUR_W*CUR_H*4;i++){cur_buf[i]=0xFF;((u32*)cur_buf)[i/4]=0x00FF00FF;}
     for(u32 dy=0;dy<16;dy++)for(u32 dx=0;dx<18;dx++){
-        u8 p=cs[dy][dx];if(p=='/')continue;
-        ((u32*)cur_buf)[dy*18+dx]=(p=='b')?0x00000000:0x00FFFFFF;   /* 黑/白都高位 0x00——0xFF 高位会与阴影半透明标记冲突 */
+        u8 p=cs[dy][dx];
+        if(p!='/'){   /* 不用 continue——本项目被 clang -O2 + continue 坑过 */
+            u32 col=(p=='b')?0x00000000:0x00FFFFFF;   /* 黑/白都高位 0x00——0xFF 高位会与阴影半透明标记冲突 */
+            for(u32 sy=0;sy<UI_SCALE;sy++)for(u32 sx=0;sx<UI_SCALE;sx++)
+                ((u32*)cur_buf)[(dy*UI_SCALE+sy)*CUR_W + (dx*UI_SCALE+sx)]=col;
+        }
     }
     struct SHEET *cur_sht = sheet_alloc(&shtctl);
-    sheet_setbuf(cur_sht, (u32*)cur_buf, 18, 16, COL_INV);
+    sheet_setbuf(cur_sht, (u32*)cur_buf, CUR_W, CUR_H, COL_INV);
     LOG_INFO("STARTUP cursor");
     
     int mx=hr/2, my=vr/2;

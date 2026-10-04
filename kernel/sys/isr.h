@@ -41,6 +41,7 @@ extern "C" void isr21_handler() {
    普通 EOI 会清错 in-service 位导致 IRQ 卡住）
    然后读 0x64：bit5=1 才是鼠标数据（bit5=0 是键盘——留给 isr21） */
 #define SHADOW 16   /* 窗口阴影宽度（与 kernel.cpp 的 draw_win_shadow 一致——拖动/关闭判定要偏移） */
+#define CUR_H  32   /* 光标高（= 16 * kernel.cpp 的 UI_SCALE——改 UI_SCALE 时这里要同步） */
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -90,8 +91,8 @@ extern "C" void isr2c_handler() {
             g_mx+=g_m.x; g_my+=g_m.y;
             if(g_mx<0)g_mx=0;
             if(g_my<0)g_my=0;
-            if(g_mx>(int)g_shtctl->xsize-16)g_mx=g_shtctl->xsize-1;
-            if(g_my>(int)g_shtctl->ysize-16)g_my=g_shtctl->ysize-1;
+            if(g_mx>(int)g_shtctl->xsize-CUR_H)g_mx=g_shtctl->xsize-1;
+            if(g_my>(int)g_shtctl->ysize-CUR_H)g_my=g_shtctl->ysize-1;
             if(g_cur_sht) sheet_slide(g_cur_sht, g_mx, g_my);
         }
     }
