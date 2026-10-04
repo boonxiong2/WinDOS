@@ -40,6 +40,10 @@ void FatalError(const char *msg);
  * void PauseAutoRefresh();
  * ...
  */
+/*Window
+ *Fullscreen((layer)win);
+ *...
+ */
 /* ── Win32-style syscall API (Ring3 user programs) ──
    syscall ABI: rax=num, rdi,rsi,rdx,r10,r8,r9 (rcx clobbered by CPU) */
 static inline void WriteConsole(const char *s) {

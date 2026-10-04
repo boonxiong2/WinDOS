@@ -587,7 +587,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 out_file_str(ndbg);
             }
             u64 bar = nvme_find();
-            ksprintf(ndbg, "[NVMe] find=%x\n", (u32)bar);
+            ksprintf(ndbg, "[NVMe] find=%lx\n", (u128)bar);
             out_file_str(ndbg);
         }
         if (r == 0) {

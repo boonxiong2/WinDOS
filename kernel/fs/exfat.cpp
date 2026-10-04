@@ -188,11 +188,11 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
     if (!g_ok) return -1;
     int nlen = 0;
     while (fname[nlen] && nlen < 255) nlen++;
-    if (nlen == 0 || size > g_bpc) return -1;   /* 简化：单簇 */
+    if (nlen == 0 || size > g_bpc) return -2;   /* 简化：单簇 */
 
     /* 1. 读根目录找 0x81（位图条目）→ 位图簇 */
     u8 rd_buf[8192];
-    if (read_cluster(2, rd_buf) != 0) return -1;
+    if (read_cluster(g_boot.root_dir_cluster, rd_buf) != 0) return -3;
     u32 bm_cluster = 0;
     for (u32 o = 0; o < g_bpc; o += 32) {
         if (rd_buf[o] == 0x81) {
@@ -201,16 +201,16 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
         }
         if (rd_buf[o] == 0x00) break;
     }
-    if (bm_cluster == 0) return -1;
+    if (bm_cluster == 0) return -4;
 
     /* 2. 位图找空簇（bit=0——"空房间"） */
-    u8 bm[512];
+    u8 bm[66536];// 简单粗暴，（反正只是玩具OS）
     if (read_cluster(bm_cluster, bm) != 0) return -1;
     u32 free_cluster = 0;
     for (u32 cc = 2; cc < g_boot.cluster_count; cc++) {
         if ((bm[cc / 8] & (1 << (cc % 8))) == 0) { free_cluster = cc; break; }
     }
-    if (free_cluster == 0) return -1;   /* 满盘 */
+    if (free_cluster == 0) return -5;   /* 满盘 */
 
     /* 3. 写数据进簇（真盘：按扇区读-改-写——小文件不破坏同扇区的其它数据） */
     {
@@ -226,12 +226,12 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
 
     /* 4. 位图置 1 + 写回（"房间标记已用"） */
     bm[free_cluster / 8] |= (u8)(1 << (free_cluster % 8));
-    if (ide_write_sector(g_ch, g_dv, cluster_to_lba(bm_cluster), 1, bm) != 0) return -4;   /* 真盘写位图 */
+    if (ide_write_sector(g_ch, g_dv, cluster_to_lba(bm_cluster), g_spc, bm) != 0) return -4;   /* 真盘写位图 */
 
     /* 5. 目录加条目组（0x85 文件 + 0xC0 流 + 0xC1 名字——"登记卡"） */
     u32 off = 0;
     while (rd_buf[off] != 0x00 && off < g_bpc) off += 32;   /* 找目录末尾 EOD */
-    if (off + 96 > g_bpc) return -1;
+    if (off + 96 > g_bpc) return -6;
     /* 0x85 文件条目 */
     rd_buf[off + 0] = 0x85;
     rd_buf[off + 2] = 0x20;                          /* 属性：档案 */
@@ -251,7 +251,7 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
     /* 目录簇写回（真盘） */
     {
         u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
-        if (ide_write_sector(g_ch, g_dv, cluster_to_lba(2), dn, rd_buf) != 0) return -5;
+        if (ide_write_sector(g_ch, g_dv, cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) != 0) return -5;
     }
     return 0;
 }
@@ -269,7 +269,7 @@ int exfat_init(void)
         if (ide_read_sector(g_ch, g_dv, g_part_lba, 1, buf) == 0
             && buf[3]=='E'&&buf[4]=='X'&&buf[5]=='F'&&buf[6]=='A'&&buf[7]=='T'
             && buf[510]==0x55 && buf[511]==0xAA) found = 1;
-        else return -3;   /* 位置已知但验不过——不再瞎试其它盘位（错盘比慢更糟）*/
+        else return -7;   /* 位置已知但验不过——不再瞎试其它盘位（错盘比慢更糟）*/
     }
     for (int ch = 0; ch <= 1 && !found; ch++) {
         for (int dv = 0; dv <= 1 && !found; dv++) {
@@ -286,7 +286,7 @@ int exfat_init(void)
             }
         }
     }
-    if (!found) return -2;   /* 4 个盘位都读不到 ExFAT */
+    if (!found) return -8;   /* 4 个盘位都读不到 ExFAT */
     /* 逐字段拷贝引导参数（小端——避免结构对齐问题） */
     memcpy(&g_boot.partition_offset,    buf + 0x40, 8);
     memcpy(&g_boot.volume_length,       buf + 0x48, 8);

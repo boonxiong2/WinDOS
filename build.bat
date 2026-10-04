@@ -38,3 +38,4 @@ if %errorlevel% neq 0 (echo ERROR: cargo build failed & pause & exit /b 1)
 xcopy /y target\x86_64-unknown-uefi\release\windos-boot.efi esp\EFI\BOOT\BOOTX64.EFI >nul
 echo === BUILD OK ===
 echo Run: run.bat
+pause

@@ -20,7 +20,7 @@
   - 待补字段：0x85 项 `SecondaryCount` / `SetChecksum` / 属性位置（现错写在 byte 2-3，属性该在 byte 4-5）、0xC0 项 `NameHash` / `NoFatChain`
   - 待补算法：exFAT 的 16 位"旋转右移 1 + 加"校验和（**不是 CRC32**），覆盖 (SecondaryCount+1)*32 字节、跳过自身 2 字节
   - 待修：目录簇号写死 `2`（测试盘根簇=**5**，照原样会把分配位图当目录写坏）、`u8 bm[512]` 对 4KB 簇会**栈溢出**、只支持单簇（≤4KB）、只写根目录、位图只写 1 扇区、名字只取低字节（中文名乱）
-  - 测试台：`run_exfat_test.bat` + `exfat_test.vhd`(MBR) / `exfat_gpt_test.vhd`(GPT，均 16MB/4KB簇/卷标 WD*)；判据 = 关机后 `chkdsk X: /f` 干净 + 资源管理器能看到文件
+  - 测试台：`run_exfat_test.bat` + `disks\exfat_test.vhd`(MBR) / `disks\exfat_gpt_test.vhd`(GPT，均 16MB/4KB簇/卷标 WD*)；判据 = 关机后 `chkdsk X: /f` 干净 + 资源管理器能看到文件
   - 目标：**用户自己实现**
 - [-] **exFAT 写路径的三条地基**（2026-10 手写时理清，别再重新推导）
   - **扇区 512B 是规范常量**（ATA 硬规定，可写死）；**每簇扇区数是从盘读的**（BPB `0x6D` 的 2 次幂 → `g_spc`，本盘 8）→ 凡按"扇区数"推进/循环的地方**必须用 `g_spc`，不能写死 8**

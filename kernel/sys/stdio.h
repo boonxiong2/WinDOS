@@ -11,7 +11,9 @@ static void pkd(char **p, int v) {
 static void pkx(char **p, unsigned v, int w) {
     for(int i=w-1;i>=0;i--){int n=(v>>(i*4))&0xF;*(*p)++=n<10?'0'+n:'A'+n-10;}
 }
-
+static void pkx64(char **p, unsigned long long v) {
+    for(int i=15;i>=0;i--){int n=(v>>(i*4))&0xF;*(*p)++=n<10?'0'+n:'A'+n-10;}
+}
 static int ksprintf(char *buf, const char *fmt, ...) {
     va_list va; va_start(va, fmt);
     char *p = buf;
@@ -21,6 +23,12 @@ static int ksprintf(char *buf, const char *fmt, ...) {
             if(fmt[i]=='s'){ const char *s=va_arg(va,const char*); while(*s)*p++=*s++; }
             else if(fmt[i]=='d'){ int v=va_arg(va,int); pkd(&p,v); }
             else if(fmt[i]=='x'){ int v=va_arg(va,int); pkx(&p,v,8); }
+            // 在 ksprintf 里，%x 那个分支后面加：
+            else if(fmt[i]=='l' && fmt[i+1]=='x'){          /* %lx → 64 位十六进制 */
+                unsigned long long v=va_arg(va,unsigned long long);
+                pkx64(&p, v);                                /* 写个 64 位版本 */
+                i++;
+            }
             else if(fmt[i]=='X'){ int v=va_arg(va,int); pkx(&p,v,4); }
             else if(fmt[i]=='0' && fmt[i+1]=='2' && fmt[i+2]=='X'){
                 int v=va_arg(va,int); pkx(&p,v,2); i+=2;   /* %02X → 2 hex digits */

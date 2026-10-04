@@ -13,5 +13,7 @@ uefi_rust/
 main.rs.txt
 cmake-build-debug/
 *.class
-*.vhd
-nvme64.img
+disks/
+kernel/build_info.h
+src/main.rs.c
+qemu_err.log
