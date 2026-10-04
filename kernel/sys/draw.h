@@ -83,6 +83,36 @@ static inline void put_str_c(u32 *fb, u32 stride, int fw, int fh,
     while (*s) { put_char_c(fb, stride, fw, fh, x, y, *s++, color); x += 8; }
 }
 
+/* 带裁剪 + 缩放的字符输出（s=2 → 16x32）——kernel.cpp 的窗口字都用这个 */
+static inline void put_char_cs(u32 *fb, u32 stride, int fw, int fh,
+                               int x, int y, char c, u32 color, int s) {
+    if (s <= 1) { put_char_c(fb, stride, fw, fh, x, y, c, color); return; }
+    const u8 *g = font[(u8)c];
+    for (int dy = 0; dy < 16; dy++) {
+        u8 bits = g[dy];
+        int py = y + dy * s;
+        for (int dx = 0; dx < 8; dx++) {
+            if (bits & (0x80 >> dx)) {
+                int px = x + dx * s;
+                for (int sy = 0; sy < s; sy++) {
+                    int ry = py + sy;
+                    if (ry >= 0 && ry < fh) {
+                        u32 *row = fb + (u32)ry * stride;
+                        for (int sx = 0; sx < s; sx++) {
+                            int rx = px + sx;
+                            if (rx >= 0 && rx < fw) row[rx] = color;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+static inline void put_str_cs(u32 *fb, u32 stride, int fw, int fh,
+                              int x, int y, const char *s, u32 color, int scale) {
+    while (*s) { put_char_cs(fb, stride, fw, fh, x, y, *s++, color, scale); x += 8 * scale; }
+}
+
 /* 像素级 alpha 混合（0..255）——阴影/淡入淡出用；除法换成 (x*257+32768)>>16 近似 */
 static inline u32 blend_alpha(u32 d, u32 s, u32 a) {
     u32 dr = (d >> 16) & 0xFF, dg = (d >> 8) & 0xFF, db = d & 0xFF;
