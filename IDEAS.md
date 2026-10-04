@@ -85,7 +85,7 @@
 ## Bug Reports
 - **【已修】端口 I/O 被编译器优化（= "QEMU IDE PIO 损坏"的真凶）**
   - 现象①：轮询 DRQ 永远超时（循环只读了一次）；②：PCI 配置读 6 次返回同一个值 `02800007`；③：写 LBA 寄存器后读回不对
-  - 根因：`drivers/io.h` 的 `in8` 带输出操作数却**没有 `volatile`` → clang -O2 当纯函数做 CSE / 提出循环
+  - 根因：`drivers/io.h` 的 `in8` 带输出操作数却**没有 `volatile`** → clang -O2 当纯函数做 CSE / 提出循环
     （`out8` 无输出操作数、按 GCC 规则隐含 volatile，才侥幸活下来）
   - 修法：`in8/in16/inl/out8/out16/outl` 全部 `volatile` + `"memory"` clobber
   - 判据：`ata port chk lba_lo reg: 5A->5A`、`ATAread … ret=0`（读到真 FAT 引导扇区）、`logdisk … WRITE_OK`
