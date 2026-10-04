@@ -102,7 +102,10 @@ fn parse_dp(dp: *const u8) -> (u32, u32, u32, u32, u32, u32) {
                 ach = unsafe { *(p as *const u8).add(4) } as u32;   /* 0=Primary 1=Secondary */
                 adv = unsafe { *(p as *const u8).add(5) } as u32;   /* 0=Master  1=Slave  */
             }
-            kind = match st { 0x01 => 1, 0x10 => 2, 0x12 => 3, 0x05 => 4, _ => kind };
+            /* Messaging 子类型（EDK2 DevicePath.h 权威值——别照字面猜！）：
+               0x01 ATAPI(IDE) / 0x12 SATA(AHCI) / 0x17 NVMe / 0x05 USB
+               （曾误写成 0x10=>SATA、0x12=>NVMe：0x10 其实是 USB WWID、NVMe 是 0x17） */
+            kind = match st { 0x01 => 1, 0x12 => 2, 0x17 => 3, 0x05 => 4, _ => kind };
         } else if t == 0x04 && st == 0x01 {             /* Media / HardDrive */
             plba = (unsafe { *((p + 8)  as *const u64) }) as u32;
             psz  = (unsafe { *((p + 16) as *const u64) }) as u32;
