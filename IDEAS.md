@@ -22,6 +22,14 @@
   - 待修：目录簇号写死 `2`（测试盘根簇=**5**，照原样会把分配位图当目录写坏）、`u8 bm[512]` 对 4KB 簇会**栈溢出**、只支持单簇（≤4KB）、只写根目录、位图只写 1 扇区、名字只取低字节（中文名乱）
   - 测试台：`run_exfat_test.bat` + `exfat_test.vhd`(MBR) / `exfat_gpt_test.vhd`(GPT，均 16MB/4KB簇/卷标 WD*)；判据 = 关机后 `chkdsk X: /f` 干净 + 资源管理器能看到文件
   - 目标：**用户自己实现**
+- [-] **exFAT 写路径的三条地基**（2026-10 手写时理清，别再重新推导）
+  - **扇区 512B 是规范常量**（ATA 硬规定，可写死）；**每簇扇区数是从盘读的**（BPB `0x6D` 的 2 次幂 → `g_spc`，本盘 8）→ 凡按"扇区数"推进/循环的地方**必须用 `g_spc`，不能写死 8**
+  - **卷参数 vs 规范**：`bp[0x60]` 是**根目录簇号**（本盘 = **5**，Windows 格式化的盘；我们自己 `mkmemdisk.py` 生成的镜像 = 2）；**簇号空间起点永远是 2** → `cluster_to_lba` 里减的**永远是 2**，与根目录在第几号簇无关
+    - 盘上铁证（`exfat_test.vhd` 同号簇两种公式）：`-2` → LBA 408 → 首字节 `0x83` 卷标条目（根目录真身 `WDTEST`）；`-5` → LBA 384 → 首字节 `0x3F` + 一片 0（空地）
+    - 写死的 `2` 该换成 `g_boot.root_dir_cluster`（三处：`exfat.cpp` 读目录 / 写回目录 / `kernel.cpp` 的 `exfat_list_dir`）
+  - **缓冲必须 = 整簇**：位图那段 `u8 bm[512]` 装不下 4KB 簇 → `read_cluster(bm_cluster, bm)` **越界写 3584B 踩坏栈上邻居**（比位图写脏更危险），`ide_write_sector(..., 8, bm)` 也只写了 1/8 真数据 + 7/8 内存垃圾
+    - 修法：`bm` 尺寸 = 整簇（本盘 4096，通用给 65536 或按 `g_bpc`）；写回传 `g_spc`（不是 8）
+  - `ide_write_sector(ch,dv,lba,count,buf)` 内部**就是逐扇区循环**（`for s<count` + `lba++`），所以 `count` 语义是"连续 N 个扇区"——传 `g_spc` 即整簇写 ✓
 - [ ] GPT 支持：内核目前只解析 MBR（`*(u32*)(mbr+454)` = 第一分区 LBA）→ GPT 盘实测 `[FS] exFAT init FAIL r=-2`
   - 现象：GPT 的 LBA0 是保护性 MBR（0xEE，指向 LBA1）→ 我们读 LBA1 拿到的是 GPT 头（无 EXFAT 签名）→ 安全失败（不写坏）
   - 方案 A（推荐，已具备）：**不解析分区表**，直接用引导器 DevicePath 给的 `part_lba`（MBR/GPT 通吃）
