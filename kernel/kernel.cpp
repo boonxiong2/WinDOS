@@ -681,8 +681,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     out_file_str("[KERNEL/FS] mainloop enter\n");
     volatile u32 last_tick = 0; int hb = 0;
     u32 t0_sec = (u32)info->tm_hour * 3600 + (u32)info->tm_min * 60 + (u32)info->tm_sec;   /* GetTime 初始时间转秒 */
-    LOG_INFO("Main 'for (;;)'entering.");
-    for (int n = 0; true; n++) {
+    LOG_INFO("Mainloop entering.");
+    for (u64 n = 0; true; n++) {
         io_cli();
         /* ORIGINAL: NO per-frame sheet_updown — cursor top is handled in the
            click handler only (sheet_updown(cur_sht, top) there). Per-frame
@@ -692,7 +692,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             hb++;
             if(hb % 200 == 0){ char dbg[48]; ksprintf(dbg,"[KERNEL/INFO] t=%d i21=%d SYSTEM ALIVE",g_ticks,_isr21_fires); LOG_INFO(dbg); }
             if(g_ticks % 100 == 0){
-                /* 任务栏时钟（GetTime 初始时间 + PIT 累加——走字） */
+                /* 任务栏时钟（GetTime 初始时间 + PIT 累加——走字） 不管他*/
                 u32 now = t0_sec + g_ticks / 100;
                 u8 rh = (u8)(now / 3600 % 24);
                 u8 rm = (u8)(now / 60 % 60);
@@ -738,6 +738,9 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                             out_file_str("\n");}
                         logged_in=1;
                         LOG_INFO("[login] ok");
+                        unsigned char un[1000];
+                        int len = ksprintf((char*)un, "{username:%s}", login_buf);
+                        exfat_write_file("Login.lgi", un, (u64)len);
                         /* 登录完成——销毁登录窗口（不让它留在桌面上）
                            然后全屏刷新一次（画掉窗口残留）。
                            整个拆除→sysret 窗口内关中断：否则 isr2c 会在
