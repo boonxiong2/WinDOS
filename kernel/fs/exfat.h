@@ -52,3 +52,4 @@ int  exfat_list_dir(u32 dir_cluster, struct EXFAT_FILE_INFO *out, int max);
 int  exfat_find(u32 dir_cluster, const char *fname, struct EXFAT_FILE_INFO *out);
 int  exfat_read_file(u32 first_cluster, u64 size, u8 *buf);
 int  exfat_write_file(const char *fname, const u8 *data, u64 size);  /* 写（内存盘测试版） */
+u32 get_root_dir_cluster(char module[]); // 看我干嘛？看函数名字！

@@ -7,6 +7,8 @@
    5. 文件可能碎片化——读取走簇链（FAT 表或连续） */
 #include "exfat.h"
 #include "ata.h"
+#include "sys/serial.h"
+#include "sys/stdio.h"
 
 /* freestanding 内核没有 string.h——自实现。
    memcpy 必须全局（extern "C"）：编译器优化（结构拷贝等）会生成外部
@@ -180,6 +182,8 @@ int exfat_read_file(u32 first_cluster, u64 size, u8 *buf)
     return 0;
 }
 
+
+
 /* ---- 写文件（内存盘测试版：创建/覆盖一个单簇文件）----
    流程（大白话）：位图找空簇 → 写数据进簇 → 位图置1 → 目录加登记卡
    注意：只支持单簇文件（size <= 一簇）；位图簇用根目录 0x81 条目 */
@@ -305,4 +309,10 @@ int exfat_init(void)
     if (g_bpc > sizeof(g_tmp)) return -4;   /* 簇太大（>8KB）——不支持 */
     g_ok = 1;
     return 0;
+}
+u32 get_root_dir_cluster(char module[]) {
+    out_file_str("[EXFAT/API CALL] API call from ");
+    out_file_str(module);
+    out_file_str("\n");
+    return g_boot.root_dir_cluster;
 }

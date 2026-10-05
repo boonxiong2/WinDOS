@@ -12,6 +12,7 @@
 #include "fs/exfat.h"
 #include "fs/ata.h"     /* ATA PIO 真盘读写（引导盘位置来自 BootInfo）*/
 #include "fs/nvme.h"
+#include "desk/page.h"   /* 页分配器（4KB 对齐 + 物理连续的页，给 DMA/页表/NVMe 队列用）*/
 
 struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
                   /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
@@ -276,6 +277,11 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     /* 裁剪基元自检（哨兵法）：界外绘制不许碰到哨兵，界内绘制必须画上 */
     { int st1 = draw_selftest(); char dbg[64];
       ksprintf(dbg, "[KERNEL/INFO] [DRAW] selftest %s (r=%d)", st1 == 0 ? "PASS" : "FAIL", st1);
+      out_file_str(dbg); out_file_str("\n"); }
+    /* 页分配器自检：分配/4KB对齐/连续/写满/释放回收 */
+    { int st2 = page_selftest(); char dbg[80];
+      ksprintf(dbg, "[KERNEL/INFO] [MEM] page allocator %s (r=%d) pool=%d pages",
+               st2 == 0 ? "PASS" : "FAIL", st2, page_free_pages());
       out_file_str(dbg); out_file_str("\n"); }
     { char dbg[112]; ksprintf(dbg,"[KERNEL/INFO] bootdev kind=%d pci=%x part_lba=%x part_sz=%x ch=%d dv=%d",
         info->ctrl_kind, info->pci_addr, info->part_lba, info->part_size, info->ata_ch, info->ata_dv); out_file_str(dbg); }
@@ -620,7 +626,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
         if (r == 0) {
             out_file_str("[KERNEL/FS] exFAT init OK\n");
             struct EXFAT_FILE_INFO infos[32];
-            int n = exfat_list_dir(2, infos, 32);   /* 根目录簇 = 2 */
+            int n = exfat_list_dir(get_root_dir_cluster("KERNEL"), infos, 32);
             char dbg[80];
             ksprintf(dbg, "[KERNEL/FS] root entries: %d\n", n);
             out_file_str(dbg);
@@ -636,10 +642,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 if (exfat_read_file(infos[0].first_cluster,
                                     infos[0].data_len, fbuf) == 0) {
                     fbuf[infos[0].data_len] = 0;
-                    ksprintf(dbg, "[FS] content: %s\n", fbuf);
+                    ksprintf(dbg, "[KERNEL/FS] content: %s\n", fbuf);
                     out_file_str(dbg);
                 } else {
-                    out_file_str("[FS] read FAIL\n");
+                    out_file_str("[KERNEL/FS] read FAIL\n");
                 }
             }
             /* ── 写文件测试：创建 TEST.TXT → 读回验证 ── */
@@ -649,7 +655,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 if (wr == 0) {
                     out_file_str("[KERNEL/FS] write OK\n");
                     struct EXFAT_FILE_INFO wfi = {};   /* 初始化——未初始化记录类型（Clang-Tidy 警告）潜在崩溃 */
-                    if (exfat_find(2, "TEST.TXT", &wfi) == 0) {
+                    if (exfat_find(get_root_dir_cluster("KERNEL"), "TEST.TXT", &wfi) == 0) {
                         u8 rbuf[64];
                         if (exfat_read_file(wfi.first_cluster, wfi.data_len, rbuf) == 0) {
                             rbuf[wfi.data_len] = 0;
