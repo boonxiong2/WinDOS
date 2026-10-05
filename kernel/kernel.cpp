@@ -64,6 +64,7 @@ static const char closebtn[14][17]={
 };
 // ── Cursor direct draw (no sheet) ──
 static void cursor_draw(u32 *fb, u32 st, int x, int y) {
+    // 所以写这个函数干什么？
 }
 static void cursor_erase(u32 *fb, u32 stride, Cursor *c, u32 hr, u32 vr) {
     // 卧槽这代码不注释整个汐统直接崩
@@ -393,6 +394,26 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory");
         LOG_INFO("US bits set");
     }
+    /* ── 映射 NVMe BAR0 (0x800000000 = 32GB) 为 2MB 大页 ──
+      US=0：NVMe 寄存器只能内核访问（用户态写 CC.EN 能关盘 / DMA 读内核内存）*/
+    {
+        static u64 nvme_pdt[512] __attribute__((aligned(4096)));   /* 新 PDT 页（4KB 对齐）*/
+        for (int i = 0; i < 512; i++) nvme_pdt[i] = 0;
+
+        u64 cr3v; __asm__ volatile("movq %%cr3, %0" : "=r"(cr3v));
+        u64 *pml4t = (u64*)cr3v;
+        u64 *pdptt = (u64*)(pml4t[0] & 0xFFFFF000);
+
+        u64 cr0v; __asm__ volatile("movq %%cr0, %0" : "=r"(cr0v));
+        __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v & ~0x10000ULL) : "memory");
+
+        pdptt[32]   = ((u64)nvme_pdt) | 0x03;       /* PDPTE→新 PDT（P|RW，US=0）*/
+        nvme_pdt[0] = 0x800000000ULL  | 0x83;       /* 2MB 大页 @32GB（P|RW|PS，US=0）*/
+
+        __asm__ volatile("movq %0, %%cr0" :: "r"(cr0v) : "memory");
+        __asm__ volatile("movq %0, %%cr3" :: "r"(cr3v) : "memory");   /* 刷 TLB */
+        out_file_str("[KERNEL/NVMe] BAR0 mapped");
+    }
     /* 设 LSTAR MSR（0xC0000082）= syscall 指令的入口——
        用户态执行 syscall 时 CPU 自动跳到这里（进内核） */
     {   u64 sce; __asm__ volatile("lea %1, %0" : "=r"(sce) : "m"(syscall_entry_asm));
@@ -545,14 +566,14 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     g_login_sht = login_sht;
     LOG_INFO("STARTUP login");
     /* ── ExFAT 测试：初始化 + 列根目录（fs/exfat.cpp——QEMU 第二块盘）── */
-    LOG_INFO("[FS] exfat-test enter");
+    out_file_str("[KERNEL/FS] exfat-test enter");
     {
-        LOG_INFO("[FS] exfat_init call");
+        out_file_str("[KERNEL/FS] exfat_init call");
         /* 测试期：不指定盘位（ctrl_kind=0 → 不强制），让 exFAT 探测自己找 exFAT 卷
            （引导卷是 FAT，会被跳过；会命中挂着的那块 exFAT 测试盘）*/
         exfat_set_dev(0, 0, 0, 0, 0);
         int r = exfat_init();
-        LOG_INFO("[FS] exfat_init done");
+        out_file_str("[KERNEL/FS] exfat_init done");
         /* ── QEMU 检测：CPUID hypervisor leaf 0x40000000
            QEMU TCG → "TCGTCGTCG"、KVM → "KVMKVMKVM"（真硬件无 hypervisor） ── */
         {
@@ -564,7 +585,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             int q = (hv[0]=='T'&&hv[1]=='C'&&hv[2]=='G') ||   /* TCGTCGTCG */
                     (hv[0]=='K'&&hv[1]=='V'&&hv[2]=='M');    /* KVMKVMKVM */
             char ndbg[64];
-            ksprintf(ndbg, "[CPU] hypervisor=\"%s\" qemu=%d\n", hv, q);
+            ksprintf(ndbg, "[CPU/INFO] hypervisor=\"%s\" qemu=%d\n", hv, q);
             out_file_str(ndbg);
             (void)q;   /* 之前这里写"QEMU IDE PIO 损坏"——真凶是 io.h 端口读非 volatile
                           被 -O2 提升（已修）：ATA PIO 读写现在实测正常 */
@@ -575,7 +596,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             for (u8 dv = 0; dv < 8; dv++) {
                 u32 vid = pci_read(0, dv, 0, 0) & 0xFFFF;
                 u32 cls = pci_read(0, dv, 0, 8);
-                ksprintf(ndbg, "[NVMe] bus0 dev%d vid=%x cls=%x/%x\n",
+                ksprintf(ndbg, "[KERNEL/NVMe] bus0 dev%d vid=%x cls=%x/%x\n",
                          dv, vid, (cls >> 24) & 0xFF, (cls >> 16) & 0xFF);
                 out_file_str(ndbg);
             }
@@ -583,22 +604,28 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             {
                 u32 b0 = pci_read(0, 4, 0, 0x10);
                 u32 b1 = pci_read(0, 4, 0, 0x14);
-                ksprintf(ndbg, "[NVMe] dev4 bar0=%x bar1=%x\n", b0, b1);
+                ksprintf(ndbg, "[KERNEL/NVMe] dev4 bar0=%x bar1=%x\n", b0, b1);
                 out_file_str(ndbg);
             }
             u64 bar = nvme_find();
-            ksprintf(ndbg, "[NVMe] find=%lx\n", (u128)bar);
+            ksprintf(ndbg, "[KERNEL/NVMe] find=%lx\n", bar);
             out_file_str(ndbg);
+            if (bar) {
+                u32 cap_lo = *(volatile u32*)(bar + 0x00);
+                u32 cap_hi = *(volatile u32*)(bar + 0x04);
+                ksprintf(ndbg, "[KERNEL/NVMe] CAP=%x.%x\n", cap_hi, cap_lo);
+                out_file_str(ndbg);
+            }
         }
         if (r == 0) {
-            out_file_str("[FS] exFAT init OK\n");
+            out_file_str("[KERNEL/FS] exFAT init OK\n");
             struct EXFAT_FILE_INFO infos[32];
             int n = exfat_list_dir(2, infos, 32);   /* 根目录簇 = 2 */
             char dbg[80];
-            ksprintf(dbg, "[FS] root entries: %d\n", n);
+            ksprintf(dbg, "[KERNEL/FS] root entries: %d\n", n);
             out_file_str(dbg);
             for (int i = 0; i < n && i < 32; i++) {
-                ksprintf(dbg, "[FS]   %s  size=%d %s\n",
+                ksprintf(dbg, "[KERNEL/FS]   %s  size=%d %s\n",
                          infos[i].name, (u32)infos[i].data_len,
                          infos[i].is_dir ? "[DIR]" : "");
                 out_file_str(dbg);
@@ -617,26 +644,26 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             }
             /* ── 写文件测试：创建 TEST.TXT → 读回验证 ── */
             {
-                const char *wdata = "HI FROM WINDOS";
+                const char *wdata = "exFAT read/write";
                 int wr = exfat_write_file("TEST.TXT", (const u8*)wdata, 14);
                 if (wr == 0) {
-                    out_file_str("[FS] write OK\n");
+                    out_file_str("[KERNEL/FS] write OK\n");
                     struct EXFAT_FILE_INFO wfi = {};   /* 初始化——未初始化记录类型（Clang-Tidy 警告）潜在崩溃 */
                     if (exfat_find(2, "TEST.TXT", &wfi) == 0) {
                         u8 rbuf[64];
                         if (exfat_read_file(wfi.first_cluster, wfi.data_len, rbuf) == 0) {
                             rbuf[wfi.data_len] = 0;
-                            ksprintf(dbg, "[FS] readback: %s\n", rbuf);
+                            ksprintf(dbg, "[KERNEL/FS] readback: %s\n", rbuf);
                             out_file_str(dbg);
                         }
                     }
                 } else {
-                    ksprintf(dbg, "[FS] write FAIL r=%d\n", wr);
+                    ksprintf(dbg, "[KERNEL/FS] write FAIL r=%d\n", wr);
                     out_file_str(dbg);
                 }
             }
         } else {
-            char dbg[48]; ksprintf(dbg, "[FS] exFAT init FAIL r=%d\n", r);
+            char dbg[48]; ksprintf(dbg, "[KERNEL/FS] exFAT init FAIL r=%d\n", r);
             out_file_str(dbg);
         }
     }
@@ -645,7 +672,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
        有键盘输入 → 处理（登录输入/Shift/CapsLock/Ctrl+Shift+B）
        鼠标 → 不在主循环了！isr2c 中断里直接处理（见 sys/isr.h）
        每 200 个时钟 tick 打印一次心跳日志（证明系统活着） */
-    LOG_INFO("[FS] mainloop enter");
+    out_file_str("[KERNEL/FS] mainloop enter\n");
     volatile u32 last_tick = 0; int hb = 0;
     u32 t0_sec = (u32)info->tm_hour * 3600 + (u32)info->tm_min * 60 + (u32)info->tm_sec;   /* GetTime 初始时间转秒 */
     LOG_INFO("Main 'for (;;)'entering.");
