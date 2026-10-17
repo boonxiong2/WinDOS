@@ -147,6 +147,108 @@ static int nvme_identify(u32 cns, u32 nsid, void *buf) {
     return nvme_admin_cmd(dw, 0);
 }
 
+/* ================= 第 8 步：I/O 队列 + 读写 =================
+   I/O SQ/CQ (qid=1)：各 64 项，物理连续（page_alloc 保证 4KB 对齐）
+   门铃偏移通式：SQ(qid) tail = 0x1000 + (2*qid)   *4
+                 CQ(qid) head = 0x1000 + (2*qid+1) *4
+   所以 qid=0 → 0x1000 / 0x1004（Admin）；qid=1 → 0x1008 / 0x100C */
+#define NVME_IO_QD        63                          /* 队列项数-1（64 项） */
+#define NVME_DB_SQ(qid)   (0x1000u + ((u32)(qid) * 2u) * 4u)
+#define NVME_DB_CQ(qid)   (0x1000u + ((u32)(qid) * 2u + 1u) * 4u)
+
+static volatile u64 *g_iosq;
+static volatile u64 *g_iocq;
+static u32 g_iosq_tail, g_iocq_head, g_iocq_phase;
+
+/* 向 I/O 队列(qid=1)提交一条命令并同步等完成
+   返回 0 成功；>0 = NVMe status；-1 未就绪；-2 超时 */
+static int nvme_io_cmd(u32 *dw, u32 *out_dw0) {
+    if (!g_nvme.ready || !g_iosq || !g_iocq) return -1;
+
+    if (g_nvme.cid == 0) g_nvme.cid = 1;
+    dw[0] = (dw[0] & 0xFFFFu) | (g_nvme.cid << 16);
+    g_nvme.cid++;
+
+    u32 pos = g_iosq_tail;
+    for (u32 i = 0; i < 8; i++)
+        g_iosq[pos * 8 + i] = ((u64)dw[i * 2]) | ((u64)dw[i * 2 + 1] << 32);
+
+    g_iosq_tail = (pos + 1) % (NVME_IO_QD + 1);
+    __asm__ volatile("" ::: "memory");                /* SQ 内容先于门铃可见 */
+    nvme_write32(g_nvme.bar, NVME_DB_SQ(1), g_iosq_tail);
+
+    for (u32 spin = 0; spin < 20000000u; spin++) {
+        u32 dw3 = ((volatile u32*)g_iocq)[g_iocq_head * 4 + 3];
+        if (((dw3 >> 16) & 1u) == g_iocq_phase) {     /* 相位位 = dword3 bit16 */
+            u32 sc  = (dw3 >> 17) & 0xFFu;
+            u32 sct = (dw3 >> 25) & 0x7u;
+            if (out_dw0) *out_dw0 = ((volatile u32*)g_iocq)[g_iocq_head * 4 + 0];
+            g_iocq_head = (g_iocq_head + 1) % (NVME_IO_QD + 1);
+            if (g_iocq_head == 0) g_iocq_phase ^= 1u;
+            __asm__ volatile("" ::: "memory");
+            nvme_write32(g_nvme.bar, NVME_DB_CQ(1), g_iocq_head);
+            if (sc || sct) return (int)(sc | (sct << 8));
+            return 0;
+        }
+        __asm__ volatile("pause");
+    }
+    return -2;
+}
+
+/* 建 I/O CQ + SQ（qid=1；PC=1 物理连续、IEN=0 不用中断）
+   返回 0 成功；-1 分配失败；其它 = 负的 Admin 错误码（-10-r / -20-r） */
+static int nvme_create_io_queues(void) {
+    u64 *cq = (u64*)page_alloc(1);
+    u64 *sq = (u64*)page_alloc(1);
+    if (!cq || !sq) return -1;
+    for (u32 i = 0; i < 512; i++) { cq[i] = 0; sq[i] = 0; }
+
+    g_iocq = (volatile u64*)cq;
+    g_iosq = (volatile u64*)sq;
+    g_iosq_tail = 0; g_iocq_head = 0; g_iocq_phase = 1;
+    u32 dw[16];
+    int r;
+
+    /* Create I/O Completion Queue — opcode 0x05
+       dw10: QID(15:0) | QSIZE(31:16)；dw11: PC(1:0) | IEN(2) | IV(31:16) */
+    for (int i = 0; i < 16; i++) dw[i] = 0;
+    dw[0]  = 0x05;
+    dw[6]  = (u32)(u64)cq;
+    dw[7]  = (u32)((u64)cq >> 32);
+    dw[10] = 1u | ((u32)NVME_IO_QD << 16);
+    dw[11] = 1u;                                      /* PC=1（物理连续） */
+    r = nvme_admin_cmd(dw, 0);
+    if (r) return -10 - r;
+
+    /* Create I/O Submission Queue — opcode 0x01
+       dw10: QID | QSIZE；dw11: PC(1:0) | QPRIO(3:2) | CQID(31:16) */
+    for (int i = 0; i < 16; i++) dw[i] = 0;
+    dw[0]  = 0x01;
+    dw[6]  = (u32)(u64)sq;
+    dw[7]  = (u32)((u64)sq >> 32);
+    dw[10] = 1u | ((u32)NVME_IO_QD << 16);
+    dw[11] = (1u << 16) | 1u;                         /* CQID=1, PC=1 */
+    r = nvme_admin_cmd(dw, 0);
+    if (r) return -20 - r;
+    return 0;
+}
+
+/* 读/写：opcode 0x02=READ / 0x01=WRITE
+   slba = 起始 LBA（64 位），nlb = 块数（>=1，每块 512B），buf 用 page_alloc（4KB 对齐）
+   一块 = 512B；一页 = 4KB = 8 块（PRP1 单页够用） */
+static int nvme_rw(u32 opcode, u32 nsid, u64 slba, u32 nlb, void *buf) {
+    u32 dw[16];
+    for (int i = 0; i < 16; i++) dw[i] = 0;
+    dw[0]  = opcode;
+    dw[1]  = nsid;                                    /* NSID=1（命名空间 1） */
+    dw[6]  = (u32)(u64)buf;
+    dw[7]  = (u32)((u64)buf >> 32);
+    dw[10] = (u32)slba;                               /* SLBA 低 32 位 */
+    dw[11] = (u32)(slba >> 32);                       /* SLBA 高 32 位 */
+    dw[12] = (nlb - 1u) & 0xFFFFu;                    /* NLB-1（低 16 位） */
+    return nvme_io_cmd(dw, 0);
+}
+
 /* 初始化控制器：等可配置 → 清寄存器 → 配 AQA/ASQ/ACQ → CC.EN=1 → 等 CSTS.RDY
    返回 0 = 就绪；-1 = 没找到；-2 = 队列分配失败；-3 = 控制器致命错误；-4 = 就绪超时 */
 static int nvme_init(void) {

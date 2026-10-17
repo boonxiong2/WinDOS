@@ -652,6 +652,35 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                         }
                         page_free(id, 1);
                     }
+
+                    /* ── 第 8 步：建 I/O 队列(1) → 写 LBA0 → 读回校验 ── */
+                    int qr = nvme_create_io_queues();
+                    ksprintf(ndbg, "[KERNEL/NVMe] create_io_q=%d\n", qr);
+                    out_file_str(ndbg);
+                    if (qr == 0) {
+                        u8 *wb = (u8*)page_alloc(1);
+                        u8 *rb = (u8*)page_alloc(1);
+                        if (wb && rb) {
+                            const char *msg = "HI FROM NVME";
+                            for (int i = 0; i < 512; i++) wb[i] = 0;
+                            for (int i = 0; msg[i] && i < 511; i++) wb[i] = (u8)msg[i];
+
+                            int wr2 = nvme_rw(0x01, 1, 0, 1, wb);   /* WRITE LBA0 */
+                            ksprintf(ndbg, "[KERNEL/NVMe] WRITE lba0=%d\n", wr2);
+                            out_file_str(ndbg);
+
+                            for (int i = 0; i < 512; i++) rb[i] = 0;
+                            int rd2 = nvme_rw(0x02, 1, 0, 1, rb);   /* READ  LBA0 */
+                            ksprintf(ndbg, "[KERNEL/NVMe] READ lba0=%d data=\"%s\"\n",
+                                     rd2, (char*)rb);
+                            out_file_str(ndbg);
+
+                            page_free(wb, 1);
+                            page_free(rb, 1);
+                        } else {
+                            out_file_str("[KERNEL/NVMe] dma buf alloc FAIL\n");
+                        }
+                    }
                 }
             }
         }
