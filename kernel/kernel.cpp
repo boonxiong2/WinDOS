@@ -598,7 +598,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
         }
         /* ── NVMe 探测：PCI 枚举打印（bus 0 所有 dev 的 vid/class——诊断）── */
         {
-            char ndbg[64];
+            char ndbg[160];   /* 装得下最长一行（init=.../SN=.../MN=.../NS=... 约 100 字符）*/
             for (u8 dv = 0; dv < 8; dv++) {
                 u32 vid = pci_read(0, dv, 0, 0) & 0xFFFF;
                 u32 cls = pci_read(0, dv, 0, 8);
@@ -621,6 +621,38 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 u32 cap_hi = *(volatile u32*)(bar + 0x04);
                 ksprintf(ndbg, "[KERNEL/NVMe] CAP=%x.%x\n", cap_hi, cap_lo);
                 out_file_str(ndbg);
+
+                /* ── 控制器初始化：Admin 队列 + CC.EN → 等 CSTS.RDY ── */
+                int ni = nvme_init();
+                ksprintf(ndbg, "[KERNEL/NVMe] init=%d CSTS=%x AQA=%x ASQ=%lx ACQ=%lx\n",
+                         ni, nvme_read32(bar, NVME_CSTS),
+                         nvme_read32(bar, NVME_AQA), (u64)g_nvme.asq, (u64)g_nvme.acq);
+                out_file_str(ndbg);
+
+                /* ── IDENTIFY：拿控制器信息（型号 / 序列号 / 命名空间数）── */
+                if (ni == 0) {
+                    u8 *id = (u8*)page_alloc(1);
+                    if (id) {
+                        int ir = nvme_identify(1, 0, id);
+                        ksprintf(ndbg, "[KERNEL/NVMe] IDENTIFY(ctrl)=%d\n", ir);
+                        out_file_str(ndbg);
+                        if (ir == 0) {
+                            /* IDENTIFY Controller 布局：
+                               [0-1]=VID [2-3]=SSVID [4-23]=SN(20B ASCII)
+                               [24-63]=MN(40B ASCII) [516-519]=NN(命名空间数) */
+                            char sn[21], mn[41];
+                            for (int i = 0; i < 20; i++) sn[i] = (char)id[4 + i];
+                            sn[20] = 0;
+                            for (int i = 0; i < 40; i++) mn[i] = (char)id[24 + i];
+                            mn[40] = 0;
+                            u32 nn = *(u32*)(id + 516);
+                            ksprintf(ndbg, "[KERNEL/NVMe] SN=\"%s\" MN=\"%s\" NS=%d\n",
+                                     sn, mn, nn);
+                            out_file_str(ndbg);
+                        }
+                        page_free(id, 1);
+                    }
+                }
             }
         }
         if (r == 0) {
