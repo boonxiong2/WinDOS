@@ -81,4 +81,5 @@ static void exc_init() {
     tbl[12]=exc12; tbl[13]=exc13; tbl[14]=exc14;
     tbl[16]=exc16; tbl[17]=exc17; tbl[18]=exc18; tbl[19]=exc19;
     for(int i=0;i<32;i++) if(tbl[i]) set_gate(i, (void*)tbl[i]);
+    idt[8].ist = 1;          /* #DF 用 IST1：栈被踩坏时仍能进来打 RIP/CR2 */
 }

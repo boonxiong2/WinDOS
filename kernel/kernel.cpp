@@ -255,7 +255,7 @@ extern "C" void win_minimize(struct SHEET *s) {
     out_file_str("[KERNEL/GUI] min:enter\n");
     for (int i = 0; i < g_wincnt; i++) {
         if (g_wins[i].sht != s) continue;
-        if (s->height < 0) { out_file_str("[KERNEL/GUI] min:already\n"); return; }
+        if (s->height < 0) { char hb[48]; ksprintf(hb, "[KERNEL/GUI] min:already h=%d\n", s->height); out_file_str(hb); return; }
         g_wins[i].min = 1;
         if (g_drag_sht == s) g_drag_sht = 0;
         out_file_str("[KERNEL/GUI] min:updown\n");

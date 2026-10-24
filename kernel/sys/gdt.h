@@ -22,6 +22,8 @@ __attribute__((aligned(8))) static u64 gdt[12] = {
 
 /* x86-64 TSS: only RSP0 needed for interrupt entry from Ring 1 */
 __attribute__((aligned(16))) static u8 tss[104];
+/* #DF 的 IST 栈：三重故障前兆（#DF）用它跑，避免"栈已经被踩坏"导致连异常都进不去 */
+static u8 df_stack[8192] __attribute__((aligned(16)));
 static u64 tss_rsp0;
 
 static void gdt_init() {
@@ -34,6 +36,9 @@ static void gdt_init() {
            | (0x89ULL << 40)
            | (((base >> 24) & 0xFF) << 56);
     gdt[7] = (base >> 32) | (0ULL << 32);   // base 32-63
+    {   u64 istp;
+        __asm__ volatile("lea %1, %0" : "=r"(istp) : "m"(df_stack[0]));
+        *(u64*)(tss + 36) = (istp + sizeof(df_stack)) & ~0xFULL;   /* IST1 = 栈顶 */ }
 
     u64 gdt_addr;
     __asm__ volatile("lea %1, %0" : "=r"(gdt_addr) : "m"(gdt[0]));  // RIP-relative!
