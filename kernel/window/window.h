@@ -303,14 +303,23 @@ static inline void sheet_free(struct SHEET *sht) {
    背景用连续写直接画（快——逐像素 map 检查写 48 万像素太慢）；
    背景图层在这跳过（它只在 sheet_slide 的小区域刷新里用）。
    其余图层正常 refreshmap + refreshsub 画上 */
+/* ⑦ 任务栏绘制钩子：refresh_all 用程序化方式画桌面（不读 back_buf），
+   所以任务栏按钮必须由上层通过这个钩子画到 vram 上。 */
+static void (*g_taskbar_paint)(u32 *fb, u32 stride, u32 w, u32 h) = 0;
+
 static inline void shtctl_refresh_all(struct SHTCTL *ctl) {
-    /* ★ 用 volatile 强制每次从 ctl->vram 加载基址——编译器内联后曾把背景写循环的
-       基址(rax)复用成调用点垃圾值(0xFF490008)→#PF。volatile 阻止该复用 */
-    volatile u32 *v = ctl->vram;
-    for (u32 y = 0; y < (u32)ctl->ysize; y++) {
-        u32 bg = (y >= (u32)ctl->ysize - 40) ? 0 : 0x00008080;
-        for (u32 x = 0; x < (u32)ctl->xsize; x++) v[y * ctl->xsize + x] = bg;
+    /* ★ 唯一真源 = sheets[0]（back_buf）：桌面底色 + 底部 40px 任务栏黑条
+       先写进 back_buf，再整屏合成（refreshsub 从 h=0 起，包含 back）。
+       以前直接写 vram，导致"只刷 back_buf"的路径（时钟/拖窗/任务栏按钮）
+       永远覆盖不到任务栏——按钮画了也不显示。 */
+    u32 *volatile bp = ctl->sheets[0]->buf;          /* volatile：-O2 内联复用基址 → #PF */
+    u32 bw = (u32)ctl->sheets[0]->bxsize;
+    u32 bh = (u32)ctl->sheets[0]->bysize;
+    for (u32 y = 0; y < bh; y++) {
+        u32 bg = (y >= bh - 40) ? 0 : 0x00008080;
+        for (u32 x = 0; x < bw; x++) bp[y * bw + x] = bg;
     }
+    if (g_taskbar_paint) g_taskbar_paint(ctl->sheets[0]->buf, bw, bw, bh);   /* 任务栏按钮画进 back_buf */
     sheet_refreshmap(ctl, 0, 0, ctl->xsize, ctl->ysize, 0);
-    sheet_refreshsub(ctl, 0, 0, ctl->xsize, ctl->ysize, 1, ctl->top);
+    sheet_refreshsub(ctl, 0, 0, ctl->xsize, ctl->ysize, 0, ctl->top);       /* ★ 0 起：包含 back 层 */
 }

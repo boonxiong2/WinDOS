@@ -53,6 +53,7 @@ extern "C" void isr21_handler() {
 #ifndef CUR_H
 #define CUR_H (16 * UI_SCALE)
 #endif
+extern "C" void taskbar_click(int x, int y);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -64,6 +65,9 @@ extern "C" void isr2c_handler() {
             /* click detection FIRST (old coords — original order) */
             if((g_m.btn&0x01)!=0){ /* left pressed */
                 if(g_mmx<0){ /* normal mode */
+                    /* ⑦ 底部 40px 是任务栏：交给 taskbar_click，不参与图层命中 */
+                    if(g_my >= (int)g_shtctl->ysize - 40){ taskbar_click(g_mx, g_my); }
+                    else {
                     /* ORIGINAL: j > 0 — skip sheets[0] = sht_back! */
                     for(int j=g_shtctl->top;j>0;j--){
                         struct SHEET *sht=g_shtctl->sheets[j];
@@ -92,6 +96,7 @@ extern "C" void isr2c_handler() {
                             }
                         }
                     }
+                    }   /* end else: 任务栏区域之外 */
                 }else{ /* drag mode — Windows-style free movement */
                     int x=g_mx-g_mmx, y=g_my-g_mmy;
                     if(x<-1||x>1||y<-1||y>1){

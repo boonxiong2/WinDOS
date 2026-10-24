@@ -181,6 +181,78 @@ extern "C" void syscall_entry_asm(void);  /* isr.S */
    g_login_sht = 登录窗口（不可关闭——判断用） */
 SHTCTL *g_shtctl;
 MP g_m; int g_mx, g_my; struct SHEET *g_cur_sht;
+
+/* ── ⑦ 窗口增强：任务栏按钮 + 最小化 ──
+   任务栏在 back_buf 底部 40px；每个窗口一个按钮（140x26）。
+   最小化 = sheet_updown(sht, -1)（图层隐藏，缓冲保留）；
+   还原 = 重新 updown 到 top，再把光标顶回 top。 */
+struct WinSlot {
+    struct SHEET *sht;      /* 0 = 当前不在合成链里（最小化/已移除）*/
+    u32 *buf; int bw, bh; u32 col_inv;
+    int x, y;               /* 最近一次位置（还原用）*/
+    const char *title; int min;
+};
+static struct WinSlot g_wins[4];
+static int g_wincnt = 0;
+static u32 *g_backfb = 0;
+static struct SHEET *g_back_sht = 0;   /* 任务栏条刷新用（只刷底部 40px）*/
+static int g_hr2 = 0, g_vr2 = 0;
+
+static void taskbar_paint(u32 *fb, u32 stride, u32 w, u32 h) {
+    if (g_wincnt == 0 || !fb) return;
+    int ty = (int)h - 40;
+    for (int i = 0; i < g_wincnt; i++) {
+        int x = 8 + i * 148, ww = 140, hh = 26, y = ty + 7;
+        if (!g_wins[i].title) continue;
+        u32 bg = g_wins[i].min ? 0x00202020 : 0x004A4A4A;
+        fill_rect_c(fb, stride, (int)w, (int)h, x, y, ww, hh, bg);
+        put_str_c(fb, stride, (int)w, (int)h, x + 6, y + 6, g_wins[i].title, 0x00FFFFFF);
+    }
+}
+
+/* 把按钮画进 back_buf（拖窗经过任务栏时 refreshsub 读的是 back_buf）*/
+static void taskbar_draw(void) {
+    if (!g_backfb) return;
+    taskbar_paint(g_backfb, (u32)g_hr2, (u32)g_hr2, (u32)g_vr2);
+}
+
+extern "C" void taskbar_click(int x, int y) {
+    if (!g_backfb || y < g_vr2 - 40) return;
+    for (int i = 0; i < g_wincnt; i++) {
+        int bx = 8 + i * 148;
+        if (x < bx || x >= bx + 140 || !g_wins[i].title) continue;
+        if (g_wins[i].min) {                     /* 还原：重新分配图层 */
+            struct SHEET *s = sheet_alloc(g_shtctl);
+            if (!s) return;
+            sheet_setbuf(s, g_wins[i].buf, g_wins[i].bw, g_wins[i].bh, g_wins[i].col_inv);
+            s->vx0 = g_wins[i].x; s->vy0 = g_wins[i].y;
+            g_wins[i].sht = s; g_wins[i].min = 0;
+            sheet_updown(s, g_shtctl->top);
+            if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);   /* 光标回最顶 */
+        } else {                                 /* 最小化：真从合成链移除（不是 height=-1）*/
+            struct SHEET *s = g_wins[i].sht;
+            if (!s) return;
+            g_wins[i].x = s->vx0; g_wins[i].y = s->vy0;
+            if (g_drag_sht == s) g_drag_sht = 0;
+            sheet_free(s);
+            g_wins[i].sht = 0; g_wins[i].min = 1;
+        }
+        taskbar_draw();
+        if (g_back_sht) sheet_refresh(g_back_sht, 0, g_vr2 - 40, g_hr2, g_vr2);
+        return;
+    }
+}
+
+/* 彻底移除一个窗口（登录成功后删掉登录窗口；任务栏也不再有它）*/
+static void win_remove(struct SHEET *s) {
+    for (int i = 0; i < g_wincnt; i++) {
+        if (g_wins[i].sht != s) continue;
+        for (int k2 = i; k2 < g_wincnt - 1; k2++) g_wins[k2] = g_wins[k2 + 1];
+        g_wincnt--;
+        if (g_login_sht == s) g_login_sht = 0;
+        return;
+    }
+}
 int g_mmx = -1, g_mmy = -1; struct SHEET *g_drag_sht = 0;
 struct SHEET *g_login_sht = 0;
 
@@ -577,6 +649,17 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                                       显示异常（map 没更新——部分黑）——拖动才恢复 */
     LOG_INFO("[login]12 glogin");
     g_login_sht = login_sht;
+    /* ⑦ 注册任务栏按钮（WinDOS 窗口 + 登录窗口），并画到 back_buf */
+    g_backfb = back_buf; g_back_sht = sht_back; g_hr2 = (int)hr; g_vr2 = (int)vr;
+    { struct WinSlot *w = &g_wins[g_wincnt++];
+      w->sht = win_sht; w->buf = win_buf; w->bw = 200*UI_SCALE+2*SHADOW; w->bh = 120*UI_SCALE+2*SHADOW;
+      w->col_inv = COL_INV; w->x = win_sht->vx0; w->y = win_sht->vy0; w->title = "WinDOS"; w->min = 0; }
+    { struct WinSlot *w = &g_wins[g_wincnt++];
+      w->sht = login_sht; w->buf = login_wbuf; w->bw = LOGIN_W+2*SHADOW; w->bh = LOGIN_H+2*SHADOW;
+      w->col_inv = COL_INV; w->x = login_sht->vx0; w->y = login_sht->vy0; w->title = "Login"; w->min = 0; }
+    taskbar_draw();
+    g_taskbar_paint = taskbar_paint;   /* refresh_all 也要画按钮 */
+    shtctl_refresh_all(&shtctl);
     LOG_INFO("STARTUP login");
     /* ── ExFAT 测试：初始化 + 列根目录（fs/exfat.cpp——QEMU 第二块盘）── */
     out_file_str("[KERNEL/FS] exfat-test enter");
@@ -850,6 +933,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                            sheet_free/shtctl_refresh_all 中间重入图层表。
                            sysret 从 R11(0x202) 恢复 IF=1——用户态照常有中断。 */
                         io_cli();
+                        win_remove(login_sht);      /* 任务栏里也删掉 Login 按钮 */
                         sheet_free(login_sht);
                         LOG_INFO("[login] freed");
                         shtctl_refresh_all(&shtctl);
