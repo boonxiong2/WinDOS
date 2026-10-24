@@ -252,15 +252,22 @@ static void win_remove(struct SHEET *s);   /* 前置声明（定义在下面）*
 
 /* 标题栏最小化按钮：隐藏图层（窗口对象/状态保留），任务栏按钮变暗 */
 extern "C" void win_minimize(struct SHEET *s) {
+    out_file_str("[KERNEL/GUI] min:enter\n");
     for (int i = 0; i < g_wincnt; i++) {
         if (g_wins[i].sht != s) continue;
+        if (s->height < 0) { out_file_str("[KERNEL/GUI] min:already\n"); return; }
         g_wins[i].min = 1;
         if (g_drag_sht == s) g_drag_sht = 0;
+        out_file_str("[KERNEL/GUI] min:updown\n");
         sheet_updown(s, -1);
+        out_file_str("[KERNEL/GUI] min:tbdraw\n");
         taskbar_draw();
+        out_file_str("[KERNEL/GUI] min:refresh\n");
         if (g_back_sht) sheet_refresh(g_back_sht, 0, g_vr2 - 40, g_hr2, g_vr2);
+        out_file_str("[KERNEL/GUI] min:done\n");
         return;
     }
+    out_file_str("[KERNEL/GUI] min:notfound\n");
 }
 
 /* 关闭按钮：销毁窗口（删任务栏槽 + 释放图层 + 重绘）*/
@@ -932,6 +939,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             io_sti();
             {char dbg[32]; ksprintf(dbg,"[KERNEL/INFO] k=%02X",d); LOG_INFO(dbg);}
             if(d<0x80){   // 按下键（<0x80）；>=0x80 是释放
+                if(d==0x3B){ win_minimize(win_sht); continue; }   /* DEBUG: F1 = 最小化 WinDOS 窗口 */
                 // 扫描码 → 字符（Shift 按下用 keytable1，否则 keytable0）
                 char s0 = (key_shift==0) ? keytable0[d] : keytable1[d];
                 // 大小写规则（原版）：大写字母在

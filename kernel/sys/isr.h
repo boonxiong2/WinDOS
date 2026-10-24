@@ -80,26 +80,23 @@ extern "C" void isr2c_handler() {
                             if(pix!=(u32)0x00FF00FF){
                                 if(j<g_shtctl->top-1) sheet_updown(sht, g_shtctl->top-1);
                                 sheet_updown(g_cur_sht, g_shtctl->top);
-                                /* ★ 两个偏移都要算：+SHADOW（缓冲含阴影带）且 ×UI_SCALE（窗口已放大）
-                                   标题栏：内容区 y 3..21、x 3..bxsize-3（源图坐标）→ 各乘 UI_SCALE 再 +SHADOW */
-                                if(3*UI_SCALE<=x&&x<sht->bxsize-3*UI_SCALE
-                                   &&3*UI_SCALE+SHADOW<=y&&y<21*UI_SCALE+SHADOW){
+                                /* ★ 判定顺序：关闭 → 最小化 → 标题栏拖动（按钮必须在拖动之前，
+                                   否则点按钮会变成拖窗口——之前 minimize 就是这么失效/崩的） */
+                                int in_close = (sht!=g_login_sht
+                                    && sht->bxsize-SHADOW-21*UI_SCALE<=x && x<sht->bxsize-SHADOW-5*UI_SCALE
+                                    && 5*UI_SCALE+SHADOW<=y && y<19*UI_SCALE+SHADOW);
+                                int in_min = (sht->bxsize-SHADOW-37*UI_SCALE<=x && x<sht->bxsize-SHADOW-21*UI_SCALE
+                                    && 5*UI_SCALE+SHADOW<=y && y<19*UI_SCALE+SHADOW);
+                                int in_title = (3*UI_SCALE<=x && x<sht->bxsize-3*UI_SCALE
+                                    && 3*UI_SCALE+SHADOW<=y && y<21*UI_SCALE+SHADOW);
+                                if(in_close){
+                                    win_closed(sht);              /* 关闭 = 销毁（含任务栏槽）*/
+                                    g_mmx=-1; g_drag_sht=0;
+                                } else if(in_min){
+                                    win_minimize(sht);            /* 最小化 = 隐藏（对象保留）*/
+                                    g_mmx=-1; g_drag_sht=0;
+                                } else if(in_title){
                                     g_mmx=g_mx; g_mmy=g_my; g_drag_sht=sht;
-                                }
-                                /* 最小化钮：源图 (w-37, 5) 起、16x14（放大同倍率） */
-                                if(sht!=g_login_sht
-                                   &&sht->bxsize-SHADOW-37*UI_SCALE<=x&&x<sht->bxsize-SHADOW-21*UI_SCALE
-                                   &&5*UI_SCALE+SHADOW<=y&&y<19*UI_SCALE+SHADOW){
-                                    win_minimize(sht);
-                                    g_mmx=-1; g_drag_sht=0;
-                                    break;
-                                }
-                                /* 关闭钮：源图 (w-21, 5) 起、16x14 → 放大后 (w-21*S, 5*S) 起、16*S x 14*S */
-                                if(sht!=g_login_sht
-                                   &&sht->bxsize-SHADOW-21*UI_SCALE<=x&&x<sht->bxsize-SHADOW-5*UI_SCALE
-                                   &&5*UI_SCALE+SHADOW<=y&&y<19*UI_SCALE+SHADOW){
-                                    win_closed(sht);          /* 关闭=销毁（含任务栏槽）*/
-                                    g_mmx=-1; g_drag_sht=0;
                                 }
                                 break;
                             }
