@@ -85,7 +85,7 @@ typedef struct {
     int ready;
 } NVMeDev;
 
-static NVMeDev g_nvme;
+extern NVMeDev g_nvme;   /* 唯一定义在 kernel.cpp —— 不能放 static，否则每个 .cpp 各一份副本 */
 
 /* 提交一条 Admin 命令（dw = 16 个 u32 的 SQE），同步轮询收 CQE
    返回 0 成功；>0 = NVMe status；-1 参数/未就绪；-2 超时 */
@@ -156,9 +156,9 @@ static int nvme_identify(u32 cns, u32 nsid, void *buf) {
 #define NVME_DB_SQ(qid)   (0x1000u + ((u32)(qid) * 2u) * 4u)
 #define NVME_DB_CQ(qid)   (0x1000u + ((u32)(qid) * 2u + 1u) * 4u)
 
-static volatile u64 *g_iosq;
-static volatile u64 *g_iocq;
-static u32 g_iosq_tail, g_iocq_head, g_iocq_phase;
+extern volatile u64 *g_iosq;      /* 同 g_nvme：定义在 kernel.cpp，所有 .cpp 共用 */
+extern volatile u64 *g_iocq;
+extern u32 g_iosq_tail, g_iocq_head, g_iocq_phase;
 
 /* 向 I/O 队列(qid=1)提交一条命令并同步等完成
    返回 0 成功；>0 = NVMe status；-1 未就绪；-2 超时 */

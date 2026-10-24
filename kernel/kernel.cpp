@@ -13,6 +13,12 @@
 #include "fs/ata.h"     /* ATA PIO 真盘读写（引导盘位置来自 BootInfo）*/
 #include "fs/nvme.h"
 #include "desk/page.h"   /* 页分配器（4KB 对齐 + 物理连续的页，给 DMA/页表/NVMe 队列用）*/
+#include "sys/logdisk.h"
+
+NVMeDev g_nvme;   /* nvme.h 里是 extern：全部 .cpp 共用这一份 */
+volatile u64 *g_iosq = 0;
+volatile u64 *g_iocq = 0;
+u32 g_iosq_tail = 0, g_iocq_head = 0, g_iocq_phase = 1; /* 日志落盘（NVMe 裸扇区 sink；out_str 双写串口+盘）*/
 
 struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
                   /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
@@ -207,6 +213,7 @@ extern "C" u64 syscall_dispatch(void) {
 }
 unsigned char keystatus[256];
 volatile u32 g_ticks;
+static int g_exfat_on_nvme = 0;   /* NVMe 上挂上 exFAT 后置 1：禁用裸扇区日志/自测 */
 
 // 键盘扫描码 → 字符表（原版 WinDOS 的）：
 //   keytable0 = 普通键（无 Shift）  keytable1 = Shift 组合键
@@ -657,7 +664,27 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                     int qr = nvme_create_io_queues();
                     ksprintf(ndbg, "[KERNEL/NVMe] create_io_q=%d\n", qr);
                     out_file_str(ndbg);
-                    if (qr == 0) {
+
+                    /* 先尝试在 NVMe 上挂 exFAT（块层此刻已切到 NVMe）。
+                       挂上就走真文件系统；只有空白盘才做裸扇区自测
+                       —— 裸写 LBA0 会覆盖 MBR/卷，绝不能在 exFAT 盘上跑。 */
+                    { char d1[80]; ksprintf(d1, "[KERNEL/NVMe] before exfat_init: ready=%d g=%x\n",
+                                          g_nvme.ready, (u32)(u64)&g_nvme); out_file_str(d1); }
+                    int r2 = exfat_init();
+                    ksprintf(ndbg, "[KERNEL/FS] exfat_over_nvme=%d\n", r2);
+                    out_file_str(ndbg);
+                    if (r2 == 0) {
+                        struct EXFAT_FILE_INFO f2[8];
+                        int n2 = exfat_list_dir(get_root_dir_cluster("KERNEL"), f2, 8);
+                        ksprintf(ndbg, "[KERNEL/FS] nvme root entries=%d\n", n2);
+                        out_file_str(ndbg);
+                        const char *wd2 = "HI FROM EXFAT ON NVME";
+                        int w3 = exfat_write_file("NVME.TXT", (const u8*)wd2, 21);
+                        ksprintf(ndbg, "[KERNEL/FS] nvme write=%d\n", w3);
+                        out_file_str(ndbg);
+                        g_exfat_on_nvme = 1;
+                    }
+                    if (qr == 0 && r2 != 0) {
                         u8 *wb = (u8*)page_alloc(1);
                         u8 *rb = (u8*)page_alloc(1);
                         if (wb && rb) {
@@ -665,13 +692,13 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                             for (int i = 0; i < 512; i++) wb[i] = 0;
                             for (int i = 0; msg[i] && i < 511; i++) wb[i] = (u8)msg[i];
 
-                            int wr2 = nvme_rw(0x01, 1, 0, 1, wb);   /* WRITE LBA0 */
-                            ksprintf(ndbg, "[KERNEL/NVMe] WRITE lba0=%d\n", wr2);
+                            int wr2 = nvme_rw(0x01, 1, 16384, 1, wb);   /* WRITE LBA16384（8MB 偏移，避开 MBR/卷头）*/
+                            ksprintf(ndbg, "[KERNEL/NVMe] WRITE lba16384=%d\n", wr2);
                             out_file_str(ndbg);
 
                             for (int i = 0; i < 512; i++) rb[i] = 0;
-                            int rd2 = nvme_rw(0x02, 1, 0, 1, rb);   /* READ  LBA0 */
-                            ksprintf(ndbg, "[KERNEL/NVMe] READ lba0=%d data=\"%s\"\n",
+                            int rd2 = nvme_rw(0x02, 1, 16384, 1, rb);   /* READ  LBA16384 */
+                            ksprintf(ndbg, "[KERNEL/NVMe] READ lba16384=%d data=\"%s\"\n",
                                      rd2, (char*)rb);
                             out_file_str(ndbg);
 
@@ -683,6 +710,15 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                     }
                 }
             }
+        }
+        /* ── 日志落盘：NVMe 就绪后启用（此后 out_str 同时写串口 + 盘）──
+           挂在裸扇区（LBA 2048 起 = 1MB 偏移），不依赖文件系统 */
+        {
+            char lb[96];
+            int lr = g_exfat_on_nvme ? -1 : logdisk_init();   /* exFAT 已挂 → 不用裸扇区日志（会踩卷）*/
+            ksprintf(lb, "[KERNEL/INFO] logdisk=%d (lba %d 起, 最多 %d 扇区)\n",
+                     lr, (int)LOGDISK_LBA0, (int)LOGDISK_MAX_SECT);
+            out_file_str(lb);
         }
         if (r == 0) {
             out_file_str("[KERNEL/FS] exFAT init OK\n");
@@ -751,7 +787,13 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
         if(g_ticks != last_tick){
             last_tick = g_ticks;
             hb++;
-            if(hb % 200 == 0){ char dbg[48]; ksprintf(dbg,"[KERNEL/INFO] t=%d i21=%d SYSTEM ALIVE",g_ticks,_isr21_fires); LOG_INFO(dbg); }
+            if(hb % 200 == 0){
+                /* 心跳只进串口（不落盘：否则盘上大半都是 SYSTEM ALIVE） */
+                char dbg[64];
+                ksprintf(dbg, "[KERNEL/INFO] t=%d i21=%d SYSTEM ALIVE\n", g_ticks, _isr21_fires);
+                out_str_serial(dbg);
+                logdisk_flush();      /* 顺手把攒着的日志刷到盘（最多丢最后一小段） */
+            }
             if(g_ticks % 100 == 0){
                 /* 任务栏时钟（GetTime 初始时间 + PIT 累加——走字） 不管他*/
                 u32 now = t0_sec + g_ticks / 100;

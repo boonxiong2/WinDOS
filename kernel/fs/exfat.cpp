@@ -7,8 +7,10 @@
    5. 文件可能碎片化——读取走簇链（FAT 表或连续） */
 #include "exfat.h"
 #include "ata.h"
+#include "nvme.h"        /* 块层：NVMe 就绪时优先走 NVMe，否则回落 ATA PIO */
 #include "sys/serial.h"
 #include "sys/stdio.h"
+
 
 /* freestanding 内核没有 string.h——自实现。
    memcpy 必须全局（extern "C"）：编译器优化（结构拷贝等）会生成外部
@@ -44,6 +46,31 @@ static u8 g_tmp[8192];             /* 临时簇缓冲（最大 8KB——16 扇�
 static u32 g_part_lba = 0;            /* 分区起始 LBA（MBR 解析） */
 static int g_ch = 0, g_dv = 0;      /* 探测到的盘位（通道×主从） */
 
+/* ---- 块层：所有扇区 I/O 统一过这两个函数 ----
+   NVMe 就绪时优先走 NVMe；用 4KB 对齐的 bounce 缓冲（PRP1 永远页对齐、
+   每次最多 8 扇区 = 一页），避免调用方传栈上非对齐指针。
+   NVMe 未就绪 → 回落 ATA PIO（老路径，行为不变）。 */
+static u8 g_bounce[4096] __attribute__((aligned(4096)));
+
+static int sec_rd(u32 lba, u32 cnt, u8 *buf) {
+    if (g_nvme.ready) {
+        if (cnt > 8) return -1;
+        if (nvme_rw(0x02, 1, (u64)lba, cnt, g_bounce) != 0) return -1;
+        memcpy(buf, g_bounce, cnt * 512);
+        return 0;
+    }
+    return ide_read_sector(g_ch, g_dv, lba, cnt, buf);
+}
+
+static int sec_wr(u32 lba, u32 cnt, const u8 *buf) {
+    if (g_nvme.ready) {
+        if (cnt > 8) return -1;
+        memcpy(g_bounce, buf, cnt * 512);
+        return nvme_rw(0x01, 1, (u64)lba, cnt, g_bounce) == 0 ? 0 : -1;
+    }
+    return ide_write_sector(g_ch, g_dv, lba, cnt, buf);
+}
+
 /* 引导盘位置由引导器经 UEFI DevicePath 问到并传进来：
    控制器类型 / 通道 / 盘位 / 分区起始 LBA——内核不再猜盘、不再暴力试 4 个位置。
    未设置或类型不支持时，回退到原来的暴力探测。 */
@@ -68,7 +95,7 @@ static int read_cluster(u32 cluster, u8 *buf)
 {
     u32 lba = cluster_to_lba(cluster);
     for (u32 i = 0; i < g_spc; i++) {
-        if (ide_read_sector(g_ch, g_dv, lba + i, 1, buf + i * g_bps) != 0) return -1;
+        if (sec_rd(lba + i, 1, buf + i * g_bps) != 0) return -1;
     }
     return 0;
 }
@@ -80,7 +107,7 @@ static u32 next_cluster(u32 cluster)
         u8 buf[512];
         u64 fat_byte = (u64)cluster * 4;
         u32 lba = g_part_lba + g_boot.fat_offset + fat_byte / g_bps;
-        if (ide_read_sector(g_ch, g_dv, lba, 1, buf) != 0) return 0xFFFFFFFF;
+        if (sec_rd(lba, 1, buf) != 0) return 0xFFFFFFFF;
         u32 v;
         memcpy(&v, buf + (fat_byte % g_bps), 4);
         return v;                    /* 0xFFFFFFFF = 链尾 */
@@ -222,15 +249,15 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
         u8 sec[512];
         for (u32 o = 0; o < (u32)size; o += 512) {
             u32 n = (u32)size - o; if (n > 512) n = 512;
-            if (ide_read_sector(g_ch, g_dv, lba0 + o / 512, 1, sec) != 0) return -2;
+            if (sec_rd(lba0 + o / 512, 1, sec) != 0) return -2;
             memcpy(sec, data + o, n);
-            if (ide_write_sector(g_ch, g_dv, lba0 + o / 512, 1, sec) != 0) return -3;
+            if (sec_wr(lba0 + o / 512, 1, sec) != 0) return -3;
         }
     }
 
     /* 4. 位图置 1 + 写回（"房间标记已用"） */
     bm[free_cluster / 8] |= (u8)(1 << (free_cluster % 8));
-    if (ide_write_sector(g_ch, g_dv, cluster_to_lba(bm_cluster), g_spc, bm) != 0) return -4;   /* 真盘写位图 */
+    if (sec_wr(cluster_to_lba(bm_cluster), g_spc, bm) != 0) return -4;   /* 真盘写位图 */
 
     /* 5. 目录加条目组（0x85 文件 + 0xC0 流 + 0xC1 名字——"登记卡"） */
     u32 off = 0;
@@ -255,7 +282,7 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
     /* 目录簇写回（真盘） */
     {
         u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
-        if (ide_write_sector(g_ch, g_dv, cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) != 0) return -5;
+        if (sec_wr(cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) != 0) return -5;
     }
     return 0;
 }
@@ -263,11 +290,28 @@ int exfat_write_file(const char *fname, const u8 *data, u64 size)
 /* ---- 初始化 ---- */
 int exfat_init(void)
 {
+    { char d0[80]; ksprintf(d0, "[KERNEL/FS] init enter: ready=%d g=%x\n",
+                             g_nvme.ready, (u32)(u64)&g_nvme); out_file_str(d0); }
     u8 buf[512], mbr[512];
     u32 part_lba = 0;
     /* 自动探测盘位：试 4 个组合（Primary/Secondary × master/slave）——
        读 MBR（LBA 0）→ 解析第一分区起始 → 读分区引导扇区验 EXFAT 签名 */
     int found = 0;
+    /* NVMe 就绪 → 优先在 NVMe 上找 exFAT（块层 sec_rd 会走 NVMe） */
+    if (g_nvme.ready) {
+        int prc = sec_rd(0, 1, mbr);
+        { char pdbg[96]; ksprintf(pdbg, "[KERNEL/FS] nvprobe rd=%d sig=%02X%02X b0=%02X\n",
+                                  prc, mbr[510], mbr[511], mbr[0]); out_file_str(pdbg); }
+        if (prc == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+            u32 pl = *(u32*)(mbr + 454);
+            if (pl && sec_rd(pl, 1, buf) == 0
+                && buf[3]=='E'&&buf[4]=='X'&&buf[5]=='F'&&buf[6]=='A'&&buf[7]=='T'
+                && buf[510]==0x55 && buf[511]==0xAA) {
+                g_ch = 0; g_dv = 0; g_part_lba = pl; found = 1;
+            }
+        }
+        if (!found) return -8;      /* NVMe 上没 exFAT 卷（空白盘） */
+    }
     if (g_dev_forced) {
         /* UEFI 给的位置：只验这一个点（读分区引导扇区确认 EXFAT 签名）*/
         if (ide_read_sector(g_ch, g_dv, g_part_lba, 1, buf) == 0
