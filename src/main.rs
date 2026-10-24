@@ -187,7 +187,9 @@ fn bsod(fb: usize, stride: u32, hr: u32, vr: u32) -> ! {
 #[repr(C)]
 struct BootInfo { fb_base: usize, fb_size: usize, hr: u32, vr: u32, stride: u32, px_fmt: u32, tm_year: u16, tm_mon: u8, tm_mday: u8, tm_hour: u8, tm_min: u8, tm_sec: u8,
                    /* ── 引导盘位置（UEFI 给的，不是猜的）── */
-                   ctrl_kind: u32, pci_addr: u32, part_lba: u32, part_size: u32, ata_ch: u32, ata_dv: u32 }
+                   ctrl_kind: u32, pci_addr: u32, part_lba: u32, part_size: u32, ata_ch: u32, ata_dv: u32,
+                   /* ── 动态堆：UEFI 分配的 EfiLoaderData 区，内核页分配器直接用 ── */
+                   heap_base: usize, heap_size: usize }
 
 /* 全局存 SystemTable / ImageHandle——naked 入口存（rdx / rcx）——start_kernel 读——
    绕过 LLVM 寄存器传递（#GP 根因）。rcx 必须存：ExitBootServices 第一个参数就是它 */
@@ -323,6 +325,13 @@ fn start_kernel() -> ! {
     uinfo_hex("kern alloc", kern); uinfo_hex("total", total);
     if kern == 0 { ucrit("kern alloc fail"); bsod(mode.fb, stride, hr, vr); }
     unsafe { core::ptr::copy_nonoverlapping(kern_src as *const u8, kern as *mut u8, kern_len); }
+    /* ── 动态堆：向 UEFI 要 64MB（EfiLoaderData=2），内核拿它当页池 ──
+       必须在 GetMemoryMap 之前分配（之后分配会让 MapKey 失效 → EBS 拒绝） */
+    let heap_pages: usize = 16384;                 /* 16384 × 4KB = 64MB */
+    let mut heap: usize = 0;
+    unsafe { ap(0, 2, heap_pages, &mut heap); }
+    uinfo_hex("heap base", heap); uinfo_hex("heap size", heap_pages << 12);
+    if heap == 0 { ucrit("heap alloc fail"); bsod(mode.fb, stride, hr, vr); }
     /* BootInfo 放分配区最后（16MB .bss 区之后）——紧贴 bin 末尾会被内核 .bss 清零糊掉 */
     let info = unsafe { (kern as *mut u8).add(total - core::mem::size_of::<BootInfo>()) as *mut BootInfo };
     /* ── GetTime：Runtime Services @88，GetTime=第一个函数 @24（EFI_TIME 16B）── */
@@ -341,7 +350,7 @@ fn start_kernel() -> ! {
             tm_mon = tm[2]; tm_mday = tm[3]; tm_hour = tm[4]; tm_min = tm[5]; tm_sec = tm[6];
         }
     }
-    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec, ctrl_kind, pci_addr, part_lba, part_size, ata_ch, ata_dv }; }
+    unsafe { *info = BootInfo { fb_base: mode.fb, fb_size: mode.fb_sz, hr, vr, stride, px_fmt: 0, tm_year, tm_mon, tm_mday, tm_hour, tm_min, tm_sec, ctrl_kind, pci_addr, part_lba, part_size, ata_ch, ata_dv, heap_base: heap, heap_size: heap_pages << 12 }; }
 
 
     //

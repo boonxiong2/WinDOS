@@ -53,7 +53,9 @@ extern "C" void isr21_handler() {
 #ifndef CUR_H
 #define CUR_H (16 * UI_SCALE)
 #endif
-extern "C" void taskbar_click(int x, int y);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
+extern "C" void taskbar_click(int x, int y);
+extern "C" void win_closed(struct SHEET *s);
+extern "C" void win_minimize(struct SHEET *s);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -84,13 +86,20 @@ extern "C" void isr2c_handler() {
                                    &&3*UI_SCALE+SHADOW<=y&&y<21*UI_SCALE+SHADOW){
                                     g_mmx=g_mx; g_mmy=g_my; g_drag_sht=sht;
                                 }
+                                /* 最小化钮：源图 (w-37, 5) 起、16x14（放大同倍率） */
+                                if(sht!=g_login_sht
+                                   &&sht->bxsize-SHADOW-37*UI_SCALE<=x&&x<sht->bxsize-SHADOW-21*UI_SCALE
+                                   &&5*UI_SCALE+SHADOW<=y&&y<19*UI_SCALE+SHADOW){
+                                    win_minimize(sht);
+                                    g_mmx=-1; g_drag_sht=0;
+                                    break;
+                                }
                                 /* 关闭钮：源图 (w-21, 5) 起、16x14 → 放大后 (w-21*S, 5*S) 起、16*S x 14*S */
                                 if(sht!=g_login_sht
                                    &&sht->bxsize-SHADOW-21*UI_SCALE<=x&&x<sht->bxsize-SHADOW-5*UI_SCALE
                                    &&5*UI_SCALE+SHADOW<=y&&y<19*UI_SCALE+SHADOW){
-                                    sheet_free(sht);
+                                    win_closed(sht);          /* 关闭=销毁（含任务栏槽）*/
                                     g_mmx=-1; g_drag_sht=0;
-                                    shtctl_refresh_all(g_shtctl);
                                 }
                                 break;
                             }

@@ -22,7 +22,8 @@ u32 g_iosq_tail = 0, g_iocq_head = 0, g_iocq_phase = 1; /* 日志落盘（NVMe �
 
 struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
                   /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
-                  u32 ctrl_kind, pci_addr, part_lba, part_size; u32 ata_ch, ata_dv; };
+                  u32 ctrl_kind, pci_addr, part_lba, part_size; u32 ata_ch, ata_dv;
+                  u64 heap_base, heap_size; };
 
 IdtEntry idt[256];
 Fifo mfifo, kfifo;
@@ -142,6 +143,15 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
             if (px >= 0 && px < W && py >= 0 && py < H)      /* 关闭钮也加界检查 */
                 buf[py * W + px] = (closebtn[y / s][x / s] == '@') ? 0x00000000 : 0x00FFFFFF;
         }
+    /* 最小化按钮（关闭钮左边一格）：白底 + 一条黑色横杠 */
+    for (int y = 0; y < 14 * s; y++)
+        for (int x = 0; x < 16 * s; x++) {
+            int px = w - 37 * s + x + SHADOW, py = 5 * s + y + SHADOW;
+            if (px >= 0 && px < W && py >= 0 && py < H) {
+                int mid_y = (7 * s <= y && y < 8 * s) && (4 * s <= x && x < 12 * s);
+                buf[py * W + px] = mid_y ? 0x00000000 : 0x00FFFFFF;
+            }
+        }
     /* ★ 贴边投影：四边从窗口边缘（0 距离）向外渐变——近深 α=0x50 → 外 α=0
        CRITICAL: 不用 continue（clang -O2 会优化成跳循环尾不递增→死循环/E06——
        之前踩过同款坑）；加 unroll(disable) 防步长展开 */
@@ -221,26 +231,44 @@ extern "C" void taskbar_click(int x, int y) {
     for (int i = 0; i < g_wincnt; i++) {
         int bx = 8 + i * 148;
         if (x < bx || x >= bx + 140 || !g_wins[i].title) continue;
-        if (g_wins[i].min) {                     /* 还原：重新分配图层 */
-            struct SHEET *s = sheet_alloc(g_shtctl);
-            if (!s) return;
-            sheet_setbuf(s, g_wins[i].buf, g_wins[i].bw, g_wins[i].bh, g_wins[i].col_inv);
-            s->vx0 = g_wins[i].x; s->vy0 = g_wins[i].y;
-            g_wins[i].sht = s; g_wins[i].min = 0;
+        struct SHEET *s = g_wins[i].sht;
+        if (!s) return;
+        if (g_wins[i].min) {                     /* 还原：重新显示（对象一直在，状态不丢）*/
+            g_wins[i].min = 0;
             sheet_updown(s, g_shtctl->top);
             if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);   /* 光标回最顶 */
-        } else {                                 /* 最小化：真从合成链移除（不是 height=-1）*/
-            struct SHEET *s = g_wins[i].sht;
-            if (!s) return;
-            g_wins[i].x = s->vx0; g_wins[i].y = s->vy0;
+        } else {                                 /* 最小化：只隐藏，不销毁 */
+            g_wins[i].min = 1;
+            sheet_updown(s, -1);
             if (g_drag_sht == s) g_drag_sht = 0;
-            sheet_free(s);
-            g_wins[i].sht = 0; g_wins[i].min = 1;
         }
         taskbar_draw();
         if (g_back_sht) sheet_refresh(g_back_sht, 0, g_vr2 - 40, g_hr2, g_vr2);
         return;
     }
+}
+
+static void win_remove(struct SHEET *s);   /* 前置声明（定义在下面）*/
+
+/* 标题栏最小化按钮：隐藏图层（窗口对象/状态保留），任务栏按钮变暗 */
+extern "C" void win_minimize(struct SHEET *s) {
+    for (int i = 0; i < g_wincnt; i++) {
+        if (g_wins[i].sht != s) continue;
+        g_wins[i].min = 1;
+        if (g_drag_sht == s) g_drag_sht = 0;
+        sheet_updown(s, -1);
+        taskbar_draw();
+        if (g_back_sht) sheet_refresh(g_back_sht, 0, g_vr2 - 40, g_hr2, g_vr2);
+        return;
+    }
+}
+
+/* 关闭按钮：销毁窗口（删任务栏槽 + 释放图层 + 重绘）*/
+extern "C" void win_closed(struct SHEET *s) {
+    win_remove(s);
+    sheet_free(s);
+    taskbar_draw();
+    shtctl_refresh_all(g_shtctl);
 }
 
 /* 彻底移除一个窗口（登录成功后删掉登录窗口；任务栏也不再有它）*/
@@ -357,6 +385,12 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     { int st1 = draw_selftest(); char dbg[64];
       ksprintf(dbg, "[KERNEL/INFO] [DRAW] selftest %s (r=%d)", st1 == 0 ? "PASS" : "FAIL", st1);
       out_file_str(dbg); out_file_str("\n"); }
+    /* ── 动态堆：把引导器从 UEFI 要来的 64MB 交给页分配器 ── */
+    { int pr = page_init(info->heap_base, info->heap_size);
+      char dbg[112];
+      ksprintf(dbg, "[KERNEL/INFO] [MEM] heap=%lx size=%lxB init=%d pages=%d\n",
+               info->heap_base, info->heap_size, pr, page_total_pages());
+      out_file_str(dbg); }
     /* 页分配器自检：分配/4KB对齐/连续/写满/释放回收 */
     { int st2 = page_selftest(); char dbg[80];
       ksprintf(dbg, "[KERNEL/INFO] [MEM] page allocator %s (r=%d) pool=%d pages",
