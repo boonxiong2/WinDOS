@@ -143,6 +143,16 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
             if (px >= 0 && px < W && py >= 0 && py < H)      /* 关闭钮也加界检查 */
                 buf[py * W + px] = (closebtn[y / s][x / s] == '@') ? 0x00000000 : 0x00FFFFFF;
         }
+    /* 最大化按钮（关闭钮左边第二格）：白底 + 方框 */
+    for (int y = 0; y < 14 * s; y++)
+        for (int x = 0; x < 16 * s; x++) {
+            int px = w - 53 * s + x + SHADOW, py = 5 * s + y + SHADOW;
+            if (px >= 0 && px < W && py >= 0 && py < H) {
+                int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
+                int inner = (x >= 4 * s && x < 12 * s && y >= 4 * s && y < 10 * s);
+                buf[py * W + px] = (edge || inner) ? 0x00000000 : 0x00FFFFFF;
+            }
+        }
     /* 最小化按钮（关闭钮左边一格）：白底 + 一条黑色横杠 */
     for (int y = 0; y < 14 * s; y++)
         for (int x = 0; x < 16 * s; x++) {
@@ -178,6 +188,32 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
     }
 }
 
+/* 普通窗口绘制（最大化用）：缓冲正好 W×H，不画阴影带——
+   带阴影的缓冲会被 refreshsub 当"合成层"处理，整屏会变暗。 */
+static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s) {
+    fill_rect_c(buf, W, W, H, 0, 0, W, H, 0x00C0C0C0);                 /* 内容区 */
+    fill_rect_c(buf, W, W, H, 0, 0, W, 24 * s, 0x00FFFFFF);            /* 标题栏 */
+    fill_rect_c(buf, W, W, H, 0, 0, W, 2 * s, 0x00404040);             /* 上边框 */
+    fill_rect_c(buf, W, W, H, 0, 0, 2 * s, 24 * s, 0x00404040);        /* 左边框 */
+    fill_rect_c(buf, W, W, H, W - 2 * s, 0, 2 * s, 24 * s, 0x00404040);/* 右边框 */
+    put_str_cs(buf, W, W, H, 5 * s, 4 * s, title, 0x00000000, s);
+    /* 三个按钮：关闭 / 最小化 / 最大化（与 draw_win_shadow 同位置，但无 SHADOW 偏移）*/
+    for (int y = 0; y < 14 * s; y++) for (int x = 0; x < 16 * s; x++) {
+        int bx = W - 21 * s + x, by = 5 * s + y;
+        if (bx >= 0 && bx < W && by >= 0 && by < H)
+            buf[by * W + bx] = (closebtn[y / s][x / s] == '@') ? 0x00000000 : 0x00FFFFFF;
+        int mx = W - 37 * s + x;
+        if (mx >= 0 && mx < W && by >= 0 && by < H)
+            buf[by * W + mx] = ((7 * s <= y && y < 8 * s) && (4 * s <= x && x < 12 * s)) ? 0x00000000 : 0x00FFFFFF;
+        int zx = W - 53 * s + x;
+        if (zx >= 0 && zx < W && by >= 0 && by < H) {
+            int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
+            int inner = (x >= 4 * s && x < 12 * s && y >= 4 * s && y < 10 * s);
+            buf[by * W + zx] = (edge || inner) ? 0x00000000 : 0x00FFFFFF;
+        }
+    }
+}
+
 extern "C" volatile u32 user_marker = 0;  /* set by user_main if sysret succeeded */
 extern "C" void syscall_entry_asm(void);  /* isr.S */
 
@@ -200,6 +236,9 @@ struct WinSlot {
     struct SHEET *sht;      /* 0 = 当前不在合成链里（最小化/已移除）*/
     u32 *buf; int bw, bh; u32 col_inv;
     int x, y;               /* 最近一次位置（还原用）*/
+    int maxed;              /* 是否最大化 */
+    struct SHEET *maxsht;   /* 最大化用的独立图层 */
+    u32 *maxbuf; u32 maxbuf_pages;   /* 最大化缓冲（来自动态堆）*/
     const char *title; int min;
 };
 static struct WinSlot g_wins[4];
@@ -231,7 +270,7 @@ extern "C" void taskbar_click(int x, int y) {
     for (int i = 0; i < g_wincnt; i++) {
         int bx = 8 + i * 148;
         if (x < bx || x >= bx + 140 || !g_wins[i].title) continue;
-        struct SHEET *s = g_wins[i].sht;
+        struct SHEET *s = g_wins[i].maxed ? g_wins[i].maxsht : g_wins[i].sht;
         if (!s) return;
         if (g_wins[i].min) {                     /* 还原：重新显示（对象一直在，状态不丢）*/
             g_wins[i].min = 0;
@@ -248,13 +287,57 @@ extern "C" void taskbar_click(int x, int y) {
     }
 }
 
+/* 标题栏最大化按钮：申请整块工作区缓冲（动态堆）→ 重画 → 占满屏幕
+   再次点击还原（释放缓冲、恢复原缓冲与位置） */
+extern "C" void win_maximize(struct SHEET *s) {
+    for (int i = 0; i < g_wincnt; i++) {
+        if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
+        if (g_wins[i].sht == g_login_sht) return;      /* 登录窗不支持 */
+        if (g_wins[i].maxed) {                         /* ── 还原：销毁全屏图层，恢复原窗口 ── */
+            if (g_wins[i].maxsht) { sheet_free(g_wins[i].maxsht); g_wins[i].maxsht = 0; }
+            if (g_wins[i].maxbuf) { page_free(g_wins[i].maxbuf, g_wins[i].maxbuf_pages); g_wins[i].maxbuf = 0; }
+            g_wins[i].maxed = 0;
+            sheet_updown(g_wins[i].sht, g_shtctl->top - 1);
+            if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);
+            shtctl_refresh_all(g_shtctl);
+            out_file_str("[KERNEL/GUI] max:restored\n");
+            return;
+        }
+        /* ── 最大化：新建一个占满工作区的图层，把原窗口隐藏起来 ── */
+        int W = g_hr2, H = g_vr2 - 40;
+        u32 pages = ((u32)W * (u32)H * 4u + 4095u) >> 12;
+        u32 *nb = (u32*)page_alloc(pages);
+        if (!nb) { out_file_str("[KERNEL/GUI] max:alloc fail\n"); return; }
+        draw_win_plain(nb, W, H, g_wins[i].title, UI_SCALE);
+        struct SHEET *ms = sheet_alloc(g_shtctl);
+        if (!ms) { page_free(nb, pages); out_file_str("[KERNEL/GUI] max:no sheet\n"); return; }
+        sheet_setbuf(ms, nb, W, H, COL_INV);
+        ms->vx0 = 0; ms->vy0 = 0;
+        g_wins[i].maxbuf = nb; g_wins[i].maxbuf_pages = pages;
+        g_wins[i].maxsht = ms; g_wins[i].maxed = 1;
+        sheet_updown(ms, g_shtctl->top);
+        sheet_updown(g_wins[i].sht, -1);               /* 原窗口隐藏（对象保留）*/
+        if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);
+        shtctl_refresh_all(g_shtctl);
+        { char mb[72]; ksprintf(mb, "[KERNEL/GUI] max:pages=%d free=%d\n", pages, page_free_pages()); out_file_str(mb); }
+        return;
+    }
+}
+
+/* 这个窗口当前是否处于最大化（isr 里据此禁止拖动：整屏图层每拖一次要刷 200 万像素）*/
+extern "C" int win_is_maximized(struct SHEET *s) {
+    for (int i = 0; i < g_wincnt; i++)
+        if (g_wins[i].sht == s || g_wins[i].maxsht == s) return g_wins[i].maxed;
+    return 0;
+}
+
 static void win_remove(struct SHEET *s);   /* 前置声明（定义在下面）*/
 
 /* 标题栏最小化按钮：隐藏图层（窗口对象/状态保留），任务栏按钮变暗 */
 extern "C" void win_minimize(struct SHEET *s) {
     out_file_str("[KERNEL/GUI] min:enter\n");
     for (int i = 0; i < g_wincnt; i++) {
-        if (g_wins[i].sht != s) continue;
+        if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
         if (s->height < 0) { char hb[48]; ksprintf(hb, "[KERNEL/GUI] min:already h=%d\n", s->height); out_file_str(hb); return; }
         g_wins[i].min = 1;
         if (g_drag_sht == s) g_drag_sht = 0;
@@ -939,7 +1022,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             io_sti();
             {char dbg[32]; ksprintf(dbg,"[KERNEL/INFO] k=%02X",d); LOG_INFO(dbg);}
             if(d<0x80){   // 按下键（<0x80）；>=0x80 是释放
-                if(d==0x3B){ win_minimize(win_sht); continue; }   /* DEBUG: F1 = 最小化 WinDOS 窗口 */
+                if(d==0x3B){ win_minimize(win_sht); continue; }
+                if(d==0x3C){ win_maximize(win_sht); continue; }   /* DEBUG: F2 = 最大化/还原 */   /* DEBUG: F1 = 最小化 WinDOS 窗口 */
                 // 扫描码 → 字符（Shift 按下用 keytable1，否则 keytable0）
                 char s0 = (key_shift==0) ? keytable0[d] : keytable1[d];
                 // 大小写规则（原版）：大写字母在

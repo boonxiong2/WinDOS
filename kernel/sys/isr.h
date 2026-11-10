@@ -55,7 +55,9 @@ extern "C" void isr21_handler() {
 #endif
 extern "C" void taskbar_click(int x, int y);
 extern "C" void win_closed(struct SHEET *s);
-extern "C" void win_minimize(struct SHEET *s);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
+extern "C" void win_minimize(struct SHEET *s);
+extern "C" void win_maximize(struct SHEET *s);
+extern "C" int  win_is_maximized(struct SHEET *s);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -85,6 +87,8 @@ extern "C" void isr2c_handler() {
                                 int in_close = (sht!=g_login_sht
                                     && sht->bxsize-SHADOW-21*UI_SCALE<=x && x<sht->bxsize-SHADOW-5*UI_SCALE
                                     && 5*UI_SCALE+SHADOW<=y && y<19*UI_SCALE+SHADOW);
+                                int in_max = (sht->bxsize-SHADOW-53*UI_SCALE<=x && x<sht->bxsize-SHADOW-37*UI_SCALE
+                                    && 5*UI_SCALE+SHADOW<=y && y<19*UI_SCALE+SHADOW);
                                 int in_min = (sht->bxsize-SHADOW-37*UI_SCALE<=x && x<sht->bxsize-SHADOW-21*UI_SCALE
                                     && 5*UI_SCALE+SHADOW<=y && y<19*UI_SCALE+SHADOW);
                                 int in_title = (3*UI_SCALE<=x && x<sht->bxsize-3*UI_SCALE
@@ -92,10 +96,13 @@ extern "C" void isr2c_handler() {
                                 if(in_close){
                                     win_closed(sht);              /* 关闭 = 销毁（含任务栏槽）*/
                                     g_mmx=-1; g_drag_sht=0;
+                                } else if(in_max){
+                                    win_maximize(sht);
+                                    g_mmx=-1; g_drag_sht=0;
                                 } else if(in_min){
                                     win_minimize(sht);            /* 最小化 = 隐藏（对象保留）*/
                                     g_mmx=-1; g_drag_sht=0;
-                                } else if(in_title){
+                                } else if(in_title && !win_is_maximized(sht)){
                                     g_mmx=g_mx; g_mmy=g_my; g_drag_sht=sht;
                                 }
                                 break;
