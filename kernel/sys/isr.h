@@ -57,7 +57,8 @@ extern "C" void taskbar_click(int x, int y);
 extern "C" void win_closed(struct SHEET *s);
 extern "C" void win_minimize(struct SHEET *s);
 extern "C" void win_maximize(struct SHEET *s);
-extern "C" int  win_is_maximized(struct SHEET *s);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
+extern "C" int  win_is_maximized(struct SHEET *s);
+extern "C" void win_restore_for_drag(struct SHEET *s, int mx, int my);   /* ⑦ 任务栏点击（定义在 kernel.cpp）*/
 extern "C" void isr2c_handler() {
     static int c2c=0; if(!c2c){out8(0x3F8,'2');out8(0x3F8,'c');out8(0x3F8,':');out8(0x3F8,'\n');c2c=1;}
     out8(0xA0,0x64); out8(0x20,0x62);   /* 特殊 EOI（IRQ12+IRQ2）——原版 */
@@ -102,7 +103,9 @@ extern "C" void isr2c_handler() {
                                 } else if(in_min){
                                     win_minimize(sht);            /* 最小化 = 隐藏（对象保留）*/
                                     g_mmx=-1; g_drag_sht=0;
-                                } else if(in_title && !win_is_maximized(sht)){
+                                } else if(in_title){
+                                    /* Windows 行为：拖最大化窗口 → 先取消最大化并按光标缩小 */
+                                    if(win_is_maximized(sht)) win_restore_for_drag(sht, g_mx, g_my);
                                     g_mmx=g_mx; g_mmy=g_my; g_drag_sht=sht;
                                 }
                                 break;

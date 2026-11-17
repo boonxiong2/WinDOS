@@ -289,21 +289,26 @@ extern "C" void taskbar_click(int x, int y) {
 
 /* 标题栏最大化按钮：申请整块工作区缓冲（动态堆）→ 重画 → 占满屏幕
    再次点击还原（释放缓冲、恢复原缓冲与位置） */
+/* 把第 i 个槽从最大化还原（释放全屏图层/缓冲，恢复原窗口）*/
+static void win_do_restore(int i) {
+    if (g_wins[i].maxsht) { sheet_free(g_wins[i].maxsht); g_wins[i].maxsht = 0; }
+    if (g_wins[i].maxbuf) { page_free(g_wins[i].maxbuf, g_wins[i].maxbuf_pages); g_wins[i].maxbuf = 0; }
+    g_wins[i].maxed = 0;
+}
+
 extern "C" void win_maximize(struct SHEET *s) {
     for (int i = 0; i < g_wincnt; i++) {
         if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
         if (g_wins[i].sht == g_login_sht) return;      /* 登录窗不支持 */
-        if (g_wins[i].maxed) {                         /* ── 还原：销毁全屏图层，恢复原窗口 ── */
-            if (g_wins[i].maxsht) { sheet_free(g_wins[i].maxsht); g_wins[i].maxsht = 0; }
-            if (g_wins[i].maxbuf) { page_free(g_wins[i].maxbuf, g_wins[i].maxbuf_pages); g_wins[i].maxbuf = 0; }
-            g_wins[i].maxed = 0;
+        if (g_wins[i].maxed) {                         /* ── 还原 ── */
+            win_do_restore(i);
             sheet_updown(g_wins[i].sht, g_shtctl->top - 1);
             if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);
             shtctl_refresh_all(g_shtctl);
             out_file_str("[KERNEL/GUI] max:restored\n");
             return;
         }
-        /* ── 最大化：新建一个占满工作区的图层，把原窗口隐藏起来 ── */
+        /* ── 最大化：新建占满工作区的图层，原窗口隐藏 ── */
         int W = g_hr2, H = g_vr2 - 40;
         u32 pages = ((u32)W * (u32)H * 4u + 4095u) >> 12;
         u32 *nb = (u32*)page_alloc(pages);
@@ -316,10 +321,32 @@ extern "C" void win_maximize(struct SHEET *s) {
         g_wins[i].maxbuf = nb; g_wins[i].maxbuf_pages = pages;
         g_wins[i].maxsht = ms; g_wins[i].maxed = 1;
         sheet_updown(ms, g_shtctl->top);
-        sheet_updown(g_wins[i].sht, -1);               /* 原窗口隐藏（对象保留）*/
+        sheet_updown(g_wins[i].sht, -1);
         if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);
         shtctl_refresh_all(g_shtctl);
         { char mb[72]; ksprintf(mb, "[KERNEL/GUI] max:pages=%d free=%d\n", pages, page_free_pages()); out_file_str(mb); }
+        return;
+    }
+}
+
+/* Windows 行为：拖动最大化窗口 → 取消最大化，并按光标相对位置缩小放到光标下 */
+extern "C" void win_restore_for_drag(struct SHEET *s, int mx, int my) {
+    for (int i = 0; i < g_wincnt; i++) {
+        if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
+        if (!g_wins[i].maxed) return;
+        int fullW = g_hr2;
+        win_do_restore(i);
+        struct SHEET *w = g_wins[i].sht;
+        int ww = g_wins[i].bw;
+        int rel = (mx * ww) / (fullW ? fullW : 1);      /* 光标在全屏窗口里的相对水平位置 */
+        w->vx0 = mx - rel;
+        w->vy0 = my - 10;                              /* 让标题栏落在光标下 */
+        if (w->vx0 < -(int)SHADOW) w->vx0 = -(int)SHADOW;
+        if (w->vy0 < -(int)SHADOW) w->vy0 = -(int)SHADOW;
+        sheet_updown(w, g_shtctl->top - 1);
+        if (g_cur_sht) sheet_updown(g_cur_sht, g_shtctl->top);
+        shtctl_refresh_all(g_shtctl);
+        out_file_str("[KERNEL/GUI] max:drag-restore\n");
         return;
     }
 }
@@ -1023,7 +1050,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             {char dbg[32]; ksprintf(dbg,"[KERNEL/INFO] k=%02X",d); LOG_INFO(dbg);}
             if(d<0x80){   // 按下键（<0x80）；>=0x80 是释放
                 if(d==0x3B){ win_minimize(win_sht); continue; }
-                if(d==0x3C){ win_maximize(win_sht); continue; }   /* DEBUG: F2 = 最大化/还原 */   /* DEBUG: F1 = 最小化 WinDOS 窗口 */
+                if(d==0x3C){ win_maximize(win_sht); continue; }
+                if(d==0x3D){ win_restore_for_drag(win_sht, 600, 300); continue; }   /* DEBUG: F3 = 模拟拖拽还原 */   /* DEBUG: F2 = 最大化/还原 */   /* DEBUG: F1 = 最小化 WinDOS 窗口 */
                 // 扫描码 → 字符（Shift 按下用 keytable1，否则 keytable0）
                 char s0 = (key_shift==0) ? keytable0[d] : keytable1[d];
                 // 大小写规则（原版）：大写字母在
