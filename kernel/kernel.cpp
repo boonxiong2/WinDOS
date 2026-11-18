@@ -14,6 +14,7 @@
 #include "fs/nvme.h"
 #include "desk/page.h"   /* 页分配器（4KB 对齐 + 物理连续的页，给 DMA/页表/NVMe 队列用）*/
 #include "sys/logdisk.h"
+#include "desk/sched.h"   /* 协作式轮转调度（13 接上）*/
 
 NVMeDev g_nvme;   /* nvme.h 里是 extern：全部 .cpp 共用这一份 */
 volatile u64 *g_iosq = 0;
@@ -232,6 +233,20 @@ static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s, u32
             buf[by * W + zx] = edge ? fg : 0x00FFFFFF;
         }
     }
+}
+
+static volatile u32 g_ta = 0, g_tb = 0, g_tc = 0;
+static void task_a(void) {
+    for (int i = 0; i < 3; i++) { g_ta++; out_str("[SCHED] A step\n"); sched_yield(); }
+    sched_exit();
+}
+static void task_c(void) {          /* 无限循环任务：用来验证 sched_kill */
+    for (;;) { g_tc++; out_str("[SCHED] C step\n"); sched_yield(); }
+}
+
+static void task_b(void) {
+    for (int i = 0; i < 3; i++) { g_tb++; out_str("[SCHED] B step\n"); sched_yield(); }
+    sched_exit();
 }
 
 extern "C" volatile u32 user_marker = 0;  /* set by user_main if sysret succeeded */
@@ -491,6 +506,11 @@ extern "C" u64 syscall_dispatch(void) {
     /* 6 = TerminateProcess(pid)：当前只有一个"进程"，pid 忽略。
        ⚠️ 现有实现只强制销毁窗口（无视 DisableClose）；真正的进程终止要等调度器。*/
     if (num == 6) {
+        /* 先试调度器任务（真"结束进程"）；没有这个 pid 再退回强制销毁窗口 */
+        if (a1 && sched_kill((u32)a1) == 0) {
+            char db[64]; ksprintf(db, "[SCHED] killed pid=%d\n", (int)a1); out_file_str(db);
+            return 0;
+        }
         int idx = -1;
         for (int i = g_wincnt - 1; i >= 0; i--) {
             if (g_wins[i].sht && g_wins[i].sht != g_login_sht) { idx = i; break; }
@@ -586,6 +606,27 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     { int st1 = draw_selftest(); char dbg[64];
       ksprintf(dbg, "[KERNEL/INFO] [DRAW] selftest %s (r=%d)", st1 == 0 ? "PASS" : "FAIL", st1);
       out_file_str(dbg); out_file_str("\n"); }
+    /* ── 调度器自检（协作式轮转）：A/B 交替各跑 3 步 ── */
+    {
+        sched_init();
+        sched_create(task_a, "A");
+        sched_create(task_b, "B");
+        int guard = 0;
+        while (sched_alive() > 0 && guard++ < 1000) sched_yield();
+        char db[112];
+        ksprintf(db, "[SCHED] done A=%d B=%d alive=%d guard=%d\n", g_ta, g_tb, sched_alive(), guard);
+        out_file_str(db);
+
+        /* kill 测试：C 是死循环任务，跑 5 轮后杀掉，之后不应再涨 */
+        u32 pc = sched_create(task_c, "C");
+        for (int i = 0; i < 5; i++) sched_yield();
+        u32 c_before = g_tc;
+        int kr = sched_kill(pc);
+        for (int i = 0; i < 5; i++) sched_yield();
+        ksprintf(db, "[SCHED] kill pid=%d r=%d C_before=%d C_after=%d alive=%d\n",
+                 (int)pc, kr, (u32)c_before, (u32)g_tc, sched_alive());
+        out_file_str(db);
+    }
     /* ── 动态堆：把引导器从 UEFI 要来的 64MB 交给页分配器 ── */
     { int pr = page_init(info->heap_base, info->heap_size);
       char dbg[112];
