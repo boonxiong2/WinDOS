@@ -923,6 +923,44 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                         ksprintf(ndbg, "[KERNEL/FS] nvme write=%d\n", w3);
                         out_file_str(ndbg);
                         g_exfat_on_nvme = 1;
+
+                        /* ── 多簇 / 覆盖 / 删除 测试（20000B = 5 簇）── */
+                        {
+                            u8 *big = (u8*)page_alloc(5);
+                            u8 *rdb = (u8*)page_alloc(5);
+                            if (big && rdb) {
+                                for (u32 i = 0; i < 20000; i++) big[i] = (u8)(i * 7 + 3);
+                                int wbig = exfat_write_file("BIG.TXT", big, 20000);
+                                struct EXFAT_FILE_INFO fb = {};
+                                int fok = (exfat_find(get_root_dir_cluster("KERNEL"), "BIG.TXT", &fb) == 0);
+                                int rbig = fok ? exfat_read_ex(&fb, rdb) : -9;
+                                int same = 0;
+                                if (rbig == 0 && fb.data_len == 20000) {
+                                    same = 1;
+                                    for (u32 i = 0; i < 20000; i++) if (rdb[i] != big[i]) { same = 0; break; }
+                                }
+                                ksprintf(ndbg, "[KERNEL/FS] BIG w=%d find=%d len=%d r=%d same=%d nf=%d\n",
+                                         wbig, fok, (u32)fb.data_len, rbig, same, (u32)fb.no_fat_chain);
+                                out_file_str(ndbg);
+
+                                int wov = exfat_write_file("BIG.TXT", big, 100);
+                                struct EXFAT_FILE_INFO fo = {};
+                                int ook = (exfat_find(get_root_dir_cluster("KERNEL"), "BIG.TXT", &fo) == 0);
+                                ksprintf(ndbg, "[KERNEL/FS] OVR w=%d len=%d (expect 100)\n",
+                                         wov, (u32)fo.data_len);
+                                out_file_str(ndbg);
+
+                                int del = exfat_delete_file("BIG.TXT");
+                                struct EXFAT_FILE_INFO fd = {};
+                                int still = (exfat_find(get_root_dir_cluster("KERNEL"), "BIG.TXT", &fd) == 0);
+                                ksprintf(ndbg, "[KERNEL/FS] DEL r=%d still=%d (expect 0/0)\n", del, still);
+                                out_file_str(ndbg);
+
+                                page_free(big, 5);
+                                page_free(rdb, 5);
+                            } else out_file_str("[KERNEL/FS] big buf alloc FAIL\n");
+                        }
+                        g_exfat_on_nvme = 1;
                     }
                     if (qr == 0 && r2 != 0) {
                         u8 *wb = (u8*)page_alloc(1);

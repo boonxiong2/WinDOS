@@ -136,6 +136,7 @@ static int parse_dir_cluster(u8 *cb, struct EXFAT_FILE_INFO *out, int max)
                 if (t2 == EXFAT_STREAM) {
                     memcpy(&fi.first_cluster, cb + p + 20, 4);  /* 首簇 */
                     memcpy(&fi.data_len,      cb + p + 24, 8);  /* 数据长度 */
+                    fi.no_fat_chain = (cb[p + 1] >> 1) & 1;     /* NoFatChain：簇连续 */
                     name_total = cb[p + 3];                    /* NameLength */
                 } else if (t2 == EXFAT_NAME) {
                     /* UTF-16 → 低字节 ASCII 近似（中文后续） */
@@ -211,80 +212,235 @@ int exfat_read_file(u32 first_cluster, u64 size, u8 *buf)
 
 
 
-/* ---- 写文件（内存盘测试版：创建/覆盖一个单簇文件）----
-   流程（大白话）：位图找空簇 → 写数据进簇 → 位图置1 → 目录加登记卡
-   注意：只支持单簇文件（size <= 一簇）；位图簇用根目录 0x81 条目 */
+/* ================= 写文件（多簇 + 覆盖 + 校验和）=================
+   分配策略：连续 ncl 个空簇（NoFatChain=1，不维护 FAT）
+   断电安全序：写数据 → 位图落盘 → 最后写目录条目（提交点） */
+static u16 ex_rot16(u16 h, u8 b) { return (u16)(((h << 15) | (h >> 1)) + b); }
+
+/* 0x85 组的 SetChecksum：覆盖 (SecondaryCount+1)*32 字节，跳过自身 byte2-3 */
+static u16 ex_set_checksum(const u8 *set, u32 secondary) {
+    u32 n = 32u * (secondary + 1u);
+    u16 s = 0;
+    for (u32 i = 0; i < n; i++) { if (i == 2 || i == 3) continue; s = ex_rot16(s, set[i]); }
+    return s;
+}
+/* 0xC0 的 NameHash：对 UTF-16LE 名字逐字节做同样的旋转加 */
+static u16 ex_name_hash(const char *name, int nlen) {
+    u16 h = 0;
+    for (int i = 0; i < nlen; i++) { h = ex_rot16(h, (u8)name[i]); h = ex_rot16(h, 0); }
+    return h;
+}
+
 int exfat_write_file(const char *fname, const u8 *data, u64 size)
 {
     if (!g_ok) return -1;
     int nlen = 0;
     while (fname[nlen] && nlen < 255) nlen++;
-    if (nlen == 0 || size > g_bpc) return -2;   /* 简化：单簇 */
+    if (nlen == 0) return -2;
+    if (nlen > 30) return -7;                      /* 最多 2 个名字条目 */
+    int nname = (nlen + 14) / 15;
 
-    /* 1. 读根目录找 0x81（位图条目）→ 位图簇 */
     u8 rd_buf[8192];
     if (read_cluster(g_boot.root_dir_cluster, rd_buf) != 0) return -3;
+
+    /* 位图簇（根目录里的 0x81 条目）*/
     u32 bm_cluster = 0;
     for (u32 o = 0; o < g_bpc; o += 32) {
-        if (rd_buf[o] == 0x81) {
-            memcpy(&bm_cluster, rd_buf + o + 20, 4);
-            break;
-        }
+        if (rd_buf[o] == 0x81) { memcpy(&bm_cluster, rd_buf + o + 20, 4); break; }
         if (rd_buf[o] == 0x00) break;
     }
     if (bm_cluster == 0) return -4;
 
-    /* 2. 位图找空簇（bit=0——"空房间"） */
-    u8 bm[66536];// 简单粗暴，（反正只是玩具OS）
+    u8 bm[66536];
     if (read_cluster(bm_cluster, bm) != 0) return -1;
-    u32 free_cluster = 0;
-    for (u32 cc = 2; cc < g_boot.cluster_count; cc++) {
-        if ((bm[cc / 8] & (1 << (cc % 8))) == 0) { free_cluster = cc; break; }
-    }
-    if (free_cluster == 0) return -5;   /* 满盘 */
 
-    /* 3. 写数据进簇（真盘：按扇区读-改-写——小文件不破坏同扇区的其它数据） */
-    {
-        u32 lba0 = cluster_to_lba(free_cluster);
-        u8 sec[512];
-        for (u32 o = 0; o < (u32)size; o += 512) {
-            u32 n = (u32)size - o; if (n > 512) n = 512;
-            if (sec_rd(lba0 + o / 512, 1, sec) != 0) return -2;
-            memcpy(sec, data + o, n);
-            if (sec_wr(lba0 + o / 512, 1, sec) != 0) return -3;
+    /* 扫目录：找同名组（覆盖）或 EOD（新建）*/
+    u32 eod = 0, slot = 0;
+    for (u32 o = 0; o + 32 <= g_bpc; ) {
+        u8 t = rd_buf[o];
+        if (t == 0x00) { eod = o; break; }
+        if (t == 0x85) {
+            u32 q = o + 32, end = o + 32;
+            char nm[64]; int k = 0;
+            while (q < g_bpc) {
+                u8 t2 = rd_buf[q];
+                if (t2 == 0xC0) { end = q; }
+                else if (t2 == 0xC1) {
+                    end = q;
+                    for (int i = 0; i < 15; i++) {
+                        u16 ch = (u16)(rd_buf[q + 2 + i * 2] | (rd_buf[q + 3 + i * 2] << 8));
+                        if (ch == 0) break;
+                        if (k < 63) nm[k++] = (char)(ch & 0xFF);
+                    }
+                } else break;
+                q += 32;
+            }
+            nm[k] = 0;
+            if (k && strcmp(nm, fname) == 0) { slot = o; break; }
+            o = end + 32;
+            continue;
+        }
+        o += 32;
+    }
+    if (slot == 0 && eod == 0) return -6;          /* 目录满（本簇内）*/
+
+    /* 连续分配 ncl 个空簇 */
+    u32 ncl = (u32)((size + g_bpc - 1) / g_bpc);
+    u32 first = 0;
+    if (ncl) {
+        u32 run = 0, start = 0;
+        for (u32 cc = 2; cc + ncl <= g_boot.cluster_count + 2 && !start; cc++) {
+            if ((bm[cc / 8] >> (cc % 8)) & 1) { run = 0; continue; }
+            if (++run == ncl) start = cc + 1 - ncl;
+        }
+        if (!start) return -5;                     /* 没有足够连续空间 */
+        first = start;
+        for (u32 i = 0; i < ncl; i++) bm[(first + i) / 8] |= (u8)(1 << ((first + i) % 8));
+    }
+
+    /* 写数据（整簇顺序；不足一扇区补零）*/
+    for (u32 i = 0; i < ncl; i++) {
+        for (u32 sec = 0; sec < g_spc; sec++) {
+            u64 off = (u64)i * g_bpc + (u64)sec * 512;
+            if (off >= size) break;
+            u8 sb[512];
+            u32 n = (u32)(size - off); if (n > 512) n = 512;
+            memcpy(sb, data + off, n);
+            if (n < 512) memset(sb + n, 0, 512 - n);
+            if (sec_wr(cluster_to_lba(first + i) + sec, 1, sb) != 0) return -3;
         }
     }
 
-    /* 4. 位图置 1 + 写回（"房间标记已用"） */
-    bm[free_cluster / 8] |= (u8)(1 << (free_cluster % 8));
-    if (sec_wr(cluster_to_lba(bm_cluster), g_spc, bm) != 0) return -4;   /* 真盘写位图 */
-
-    /* 5. 目录加条目组（0x85 文件 + 0xC0 流 + 0xC1 名字——"登记卡"） */
-    u32 off = 0;
-    while (rd_buf[off] != 0x00 && off < g_bpc) off += 32;   /* 找目录末尾 EOD */
-    if (off + 96 > g_bpc) return -6;
-    /* 0x85 文件条目 */
-    rd_buf[off + 0] = 0x85;
-    rd_buf[off + 2] = 0x20;                          /* 属性：档案 */
-    /* 0xC0 流条目 */
-    rd_buf[off + 32 + 0] = 0xC0;
-    rd_buf[off + 32 + 3] = (u8)nlen;                 /* 名字长度 */
-    memcpy(rd_buf + off + 32 + 8, &size, 8);         /* 有效数据长度 */
-    memcpy(rd_buf + off + 32 + 20, &free_cluster, 4);/* 首簇 */
-    memcpy(rd_buf + off + 32 + 24, &size, 8);        /* 数据长度 */
-    /* 0xC1 名字条目（UTF-16——ASCII 低字节） */
-    rd_buf[off + 64 + 0] = 0xC1;
-    for (int i = 0; i < nlen; i++) {
-        rd_buf[off + 64 + 2 + i * 2] = (u8)fname[i];
-        rd_buf[off + 64 + 2 + i * 2 + 1] = 0;
+    /* 覆盖：释放旧文件占用的簇 */
+    if (slot) {
+        u32 of = 0; u64 ol = 0;
+        memcpy(&of, rd_buf + slot + 32 + 20, 4);
+        memcpy(&ol, rd_buf + slot + 32 + 24, 8);
+        if (of >= 2) {
+            u32 onc = (u32)((ol + g_bpc - 1) / g_bpc);
+            for (u32 i = 0; i < onc; i++) {
+                u32 c = of + i;
+                if (c < g_boot.cluster_count + 2) bm[c / 8] &= (u8)~(1 << (c % 8));
+            }
+        }
     }
-    rd_buf[off + 96] = 0x00;                         /* 新 EOD */
-    /* 目录簇写回（真盘） */
-    {
-        u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
-        if (sec_wr(cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) != 0) return -5;
+
+    /* 位图落盘 */
+    if (sec_wr(cluster_to_lba(bm_cluster), g_spc, bm) != 0) return -4;
+
+    /* 目录条目 */
+    u32 off = slot ? slot : eod;
+    u32 sec_count = 1u + (u32)nname;               /* 0xC0 + 0xC1×n */
+    if (!slot) {
+        if (off + 32u * (1u + sec_count) + 32u > g_bpc) return -6;
+        memset(rd_buf + off, 0, 32u * (1u + sec_count));
+        rd_buf[off + 0] = 0x85;
+    }
+    /* 新建和覆盖都要刷新 0x85 头部（覆盖时旧条目可能是别家写的）*/
+    rd_buf[off + 0] = 0x85;
+    rd_buf[off + 1] = (u8)sec_count;                /* SecondaryCount */
+    rd_buf[off + 4] = 0x20; rd_buf[off + 5] = 0x00; /* 属性：档案 */
+    u32 st = off + 32;
+    rd_buf[st + 0] = 0xC0;
+    rd_buf[st + 1] = 0x03;                          /* AllocationPossible | NoFatChain */
+    rd_buf[st + 3] = (u8)nlen;
+    { u16 nh = ex_name_hash(fname, nlen); memcpy(rd_buf + st + 4, &nh, 2); }
+    { u64 v = size; memcpy(rd_buf + st + 8, &v, 8); }     /* ValidDataLength */
+    memcpy(rd_buf + st + 20, &first, 4);                  /* FirstCluster */
+    { u64 v = size; memcpy(rd_buf + st + 24, &v, 8); }    /* DataLength */
+    for (int e = 0; e < nname; e++) {
+        u32 np = st + 32u * (u32)(e + 1);
+        rd_buf[np + 0] = 0xC1;
+        for (int i = 0; i < 15; i++) {
+            int idx = e * 15 + i;
+            u16 ch = (idx < nlen) ? (u16)(u8)fname[idx] : 0;
+            rd_buf[np + 2 + i * 2] = (u8)ch;
+            rd_buf[np + 3 + i * 2] = (u8)(ch >> 8);
+        }
+    }
+    u32 eod2 = off + 32u * (1u + sec_count);
+    if (eod2 < g_bpc) rd_buf[eod2] = 0x00;
+    { u16 ck = ex_set_checksum(rd_buf + off, sec_count); memcpy(rd_buf + off + 2, &ck, 2); }
+
+    { u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
+      if (sec_wr(cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) != 0) return -5; }
+    return 0;
+}
+
+/* ---- 按条目读（NoFatChain → 连续簇；否则走 FAT 链）---- */
+int exfat_read_ex(const struct EXFAT_FILE_INFO *fi, u8 *buf)
+{
+    if (!g_ok || !fi) return -1;
+    u64 remaining = fi->data_len;
+    u32 cluster = fi->first_cluster, idx = 0;
+    while (remaining > 0) {
+        u32 c = fi->no_fat_chain ? (fi->first_cluster + idx) : cluster;
+        if (c < 2 || c == 0xFFFFFFFF) return -1;
+        if (read_cluster(c, g_tmp) != 0) return -1;
+        u64 chunk = remaining < g_bpc ? remaining : g_bpc;
+        memcpy(buf, g_tmp, (u32)chunk);
+        buf += chunk; remaining -= chunk; idx++;
+        if (!fi->no_fat_chain) cluster = next_cluster(cluster);
     }
     return 0;
+}
+
+/* ---- 删除文件：条目组标记 0xE5 + 释放簇 ---- */
+int exfat_delete_file(const char *fname)
+{
+    if (!g_ok) return -1;
+    u8 rd_buf[8192];
+    if (read_cluster(g_boot.root_dir_cluster, rd_buf) != 0) return -2;
+    u32 bm_cluster = 0;
+    for (u32 o = 0; o < g_bpc; o += 32) {
+        if (rd_buf[o] == 0x81) { memcpy(&bm_cluster, rd_buf + o + 20, 4); break; }
+        if (rd_buf[o] == 0x00) break;
+    }
+    if (!bm_cluster) return -3;
+
+    for (u32 o = 0; o + 32 <= g_bpc; ) {
+        u8 t = rd_buf[o];
+        if (t == 0x00) break;
+        if (t != 0x85) { o += 32; continue; }
+        u32 q = o + 32, end = o + 32;
+        char nm[64]; int k = 0;
+        u32 first = 0; u64 len = 0; u32 secn = rd_buf[o + 1];
+        while (q < g_bpc) {
+            u8 t2 = rd_buf[q];
+            if (t2 == 0xC0) { end = q; memcpy(&first, rd_buf + q + 20, 4); memcpy(&len, rd_buf + q + 24, 8); }
+            else if (t2 == 0xC1) {
+                end = q;
+                for (int i = 0; i < 15; i++) {
+                    u16 ch = (u16)(rd_buf[q + 2 + i * 2] | (rd_buf[q + 3 + i * 2] << 8));
+                    if (ch == 0) break;
+                    if (k < 63) nm[k++] = (char)(ch & 0xFF);
+                }
+            } else break;
+            q += 32;
+        }
+        nm[k] = 0;
+        if (k && strcmp(nm, fname) == 0) {
+            /* 释放簇 */
+            if (first >= 2 && len) {
+                u8 bm[66536];
+                if (read_cluster(bm_cluster, bm) == 0) {
+                    u32 onc = (u32)((len + g_bpc - 1) / g_bpc);
+                    for (u32 i = 0; i < onc; i++) {
+                        u32 c = first + i;
+                        if (c < g_boot.cluster_count + 2) bm[c / 8] &= (u8)~(1 << (c % 8));
+                    }
+                    sec_wr(cluster_to_lba(bm_cluster), g_spc, bm);
+                }
+            }
+            /* 条目组全部标记删除（0xE5）*/
+            u32 e = o, n = 0;
+            while (e <= end && n <= secn) { rd_buf[e] = 0xE5; e += 32; n++; }
+            u32 dn = g_bpc / 512; if (dn == 0) dn = 1;
+            return sec_wr(cluster_to_lba(g_boot.root_dir_cluster), dn, rd_buf) == 0 ? 0 : -4;
+        }
+        o = end + 32;
+    }
+    return -5;   /* 没找到 */
 }
 
 /* ---- 初始化 ---- */

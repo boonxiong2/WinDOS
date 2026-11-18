@@ -43,6 +43,7 @@ struct EXFAT_FILE_INFO {
     u64 data_len;           /* 0xC0 流条目的数据长度 */
     char name[300];         /* 文件名（UTF-16 → 低字节 ASCII 近似） */
     u8  is_dir;             /* 0x85 文件条目的目录属性位(0x10) */
+    u8  no_fat_chain;       /* 0xC0 byte1 bit1：1=簇连续，FAT 表无效 */
 };
 
 /* ---- API ---- */
@@ -51,5 +52,7 @@ int  exfat_init(void);       /* 读引导扇区 + 解析参数（先验 "EXFAT"�
 int  exfat_list_dir(u32 dir_cluster, struct EXFAT_FILE_INFO *out, int max);
 int  exfat_find(u32 dir_cluster, const char *fname, struct EXFAT_FILE_INFO *out);
 int  exfat_read_file(u32 first_cluster, u64 size, u8 *buf);
+int  exfat_read_ex(const struct EXFAT_FILE_INFO *fi, u8 *buf);   /* 按条目读（支持 NoFatChain 连续簇）*/
+int  exfat_delete_file(const char *fname);                       /* 删除（条目置 0xE5 + 释放簇）*/
 int  exfat_write_file(const char *fname, const u8 *data, u64 size);  /* 写（内存盘测试版） */
 u32 get_root_dir_cluster(char module[]); // 看我干嘛？看函数名字！
