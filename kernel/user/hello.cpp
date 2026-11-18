@@ -27,6 +27,12 @@ extern "C" void user_main(void) {
         "leaq msg(%%rip), %%rdi;"
         "syscall"
         :: : "rax", "rdi", "rcx", "r11", "memory");
+    /* 窗口按钮软限制演示：三个 API 各调一次（syscall 3/4/5）*/
+    DisableMaximize();
+    DisableMinimize();
+    DisableClose();
+    WriteConsole("CHROME APIS OK\n");
+
     /* idle loop: mouse is handled by isr2c (kernel), so no polling API —
        just spin; PIT IRQs (IF=1) keep firing: isr20 → sysretq back. */
     volatile u64 n = 0;

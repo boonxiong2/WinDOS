@@ -16,7 +16,7 @@
 | 设备发现 | 问 UEFI「我从哪块盘来」（`LoadedImage → DeviceHandle → DevicePath`）→ 控制器类型 / PCI 位置 / 分区起始 LBA 写进 `BootInfo` —— **不猜盘、不硬编码 dev 号** |
 | 显示模式 | 自己 `SetMode` 挑 **1920×1080**（只接受"恰好"该尺寸，绝不选更大——缓冲区是按 FHD 开的） |
 | 图形 | 图层系统（sheet 移植）+ 半透明阴影（合成减）+ 窗口拖动 / 关闭 + 软件光标 + 任务栏时钟 |
-| 用户态 | 登录 → `sysret` 进 **Ring3** → `syscall` 回内核（`SYS_WRITE` 已通）；`info registers` 里 `CPL=3 / CS=002b / SS=0023` |
+| 用户态 | 登录 → `sysret` 进 **Ring3** → `syscall` 回内核；`info registers` 里 `CPL=3 / CS=002b / SS=0023`。syscall：1 `WriteConsole`、2 `DrawRect`(未实现)、3 `DisableMaximize`、4 `DisableMinimize`、5 `DisableClose`（后三个是**界面层软限制**：只把标题栏按钮置灰并拒绝操作，管理员 `TerminateProcess` 仍可结束进程） |
 | 安全模型 | `IOPL=0`（sysret 的 R11=`0x202`）+ `UMIP`（CPUID 门控）+ syscall 指针校验（上界按 `_bss_end` 推导，不写死 8MB）。⚠️ **内核页/IDT 仍是 `US=1`**（为了让 Ring3 跑，US 位翻到 `_bss_end`）→ Ring3 理论上能读内核内存，这是已知技术债 |
 | 崩溃处理 | Win11 风格黑屏 + **崩溃处理自身安全**（防重入 + 显存指针合法性检查，不可信时只打串口不画屏）；`#DF` 走 **IST1 独立栈**（8KB），三重故障也能打出 RIP/CR2 |
 | 存储（ATA） | ATA PIO 真盘 **读 + 写**：读出 FAT 引导扇区 `"MSWIN4.1"`；签名盘写扇区并读回 = `WRITE_OK` |

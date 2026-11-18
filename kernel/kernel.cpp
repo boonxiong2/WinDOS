@@ -145,7 +145,7 @@ static void draw_win(u32 *buf, int w, int h, const char *title) {
 
 /* s = UI 缩放（1=原尺寸；FHD 下用 UI_SCALE=2：标题栏/关闭钮/标题字一起放大）
    注：阴影带宽 SHADOW 不缩放（它同时被光标/拖拽/刷新联动引用，改动面太大） */
-static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, int can_max) {
+static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, u32 chrome) {
     int W = w + 2 * SHADOW, H = h + 2 * SHADOW;
     /* 内容区 + 标题栏：全部走带裁剪的矩形填充（原来手写循环——越界就踩别的全局变量） */
     fill_rect_c(buf, W, W, H, SHADOW, SHADOW, w, h, 0x00C0C0C0);                 /* 内容区（居中，四周留阴影带） */
@@ -157,8 +157,10 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, in
     for (int y = 0; y < 14 * s; y++)
         for (int x = 0; x < 16 * s; x++) {
             int px = w - 21 * s + x + SHADOW, py = 5 * s + y + SHADOW;
-            if (px >= 0 && px < W && py >= 0 && py < H)      /* 关闭钮也加界检查 */
-                buf[py * W + px] = (closebtn[y / s][x / s] == '@') ? 0x00000000 : 0x00FFFFFF;
+            if (px >= 0 && px < W && py >= 0 && py < H) {    /* 关闭钮也加界检查 */
+                u32 fg = (chrome & 1) ? 0x00000000 : 0x00AAAAAA;   /* 1=可关闭 */
+                buf[py * W + px] = (closebtn[y / s][x / s] == '@') ? fg : 0x00FFFFFF;
+            }
         }
     /* 最大化按钮（关闭钮左边第二格）：白底 + 单个方框；不可最大化时画灰 */
     for (int y = 0; y < 14 * s; y++)
@@ -166,7 +168,7 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, in
             int px = w - 53 * s + x + SHADOW, py = 5 * s + y + SHADOW;
             if (px >= 0 && px < W && py >= 0 && py < H) {
                 int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
-                u32 fg = can_max ? 0x00000000 : 0x00AAAAAA;
+                u32 fg = (chrome & 4) ? 0x00000000 : 0x00AAAAAA;   /* 4=可最大化 */
                 buf[py * W + px] = edge ? fg : 0x00FFFFFF;
             }
         }
@@ -176,7 +178,8 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, in
             int px = w - 37 * s + x + SHADOW, py = 5 * s + y + SHADOW;
             if (px >= 0 && px < W && py >= 0 && py < H) {
                 int mid_y = (7 * s <= y && y < 8 * s) && (4 * s <= x && x < 12 * s);
-                buf[py * W + px] = mid_y ? 0x00000000 : 0x00FFFFFF;
+                u32 fg = (chrome & 2) ? 0x00000000 : 0x00AAAAAA;   /* 2=可最小化 */
+                buf[py * W + px] = mid_y ? fg : 0x00FFFFFF;
             }
         }
     /* ★ 贴边投影：四边从窗口边缘（0 距离）向外渐变——近深 α=0x50 → 外 α=0
@@ -207,7 +210,7 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, in
 
 /* 普通窗口绘制（最大化用）：缓冲正好 W×H，不画阴影带——
    带阴影的缓冲会被 refreshsub 当"合成层"处理，整屏会变暗。 */
-static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s, int can_max) {
+static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s, u32 chrome) {
     fill_rect_c(buf, W, W, H, 0, 0, W, H, 0x00C0C0C0);                 /* 内容区 */
     fill_rect_c(buf, W, W, H, 0, 0, W, 24 * s, 0x00FFFFFF);            /* 标题栏 */
     fill_rect_c(buf, W, W, H, 0, 0, W, 2 * s, 0x00404040);             /* 上边框 */
@@ -225,7 +228,7 @@ static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s, int
         int zx = W - 53 * s + x;
         if (zx >= 0 && zx < W && by >= 0 && by < H) {
             int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
-            u32 fg = can_max ? 0x00000000 : 0x00AAAAAA;
+            u32 fg = (chrome & 4) ? 0x00000000 : 0x00AAAAAA;   /* 4=可最大化 */
             buf[by * W + zx] = edge ? fg : 0x00FFFFFF;
         }
     }
@@ -257,6 +260,7 @@ struct WinSlot {
     struct SHEET *maxsht;   /* 最大化用的独立图层 */
     u32 *maxbuf; u32 maxbuf_pages;   /* 最大化缓冲（来自动态堆）*/
     const char *title; int min;
+    u32 chrome;             /* 1=可关闭 2=可最小化 4=可最大化 */
 };
 static struct WinSlot g_wins[4];
 static int g_wincnt = 0;
@@ -317,6 +321,7 @@ extern "C" void win_maximize(struct SHEET *s) {
     for (int i = 0; i < g_wincnt; i++) {
         if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
         if (g_wins[i].sht == g_login_sht) return;      /* 登录窗不支持 */
+        if (!(g_wins[i].chrome & 4)) return;            /* 该窗口禁用了最大化 */
         if (g_wins[i].maxed) {                         /* ── 还原 ── */
             win_do_restore(i);
             sheet_updown(g_wins[i].sht, g_shtctl->top - 1);
@@ -330,7 +335,7 @@ extern "C" void win_maximize(struct SHEET *s) {
         u32 pages = ((u32)W * (u32)H * 4u + 4095u) >> 12;
         u32 *nb = (u32*)page_alloc(pages);
         if (!nb) { out_file_str("[KERNEL/GUI] max:alloc fail\n"); return; }
-        draw_win_plain(nb, W, H, g_wins[i].title, UI_SCALE, 1);
+        draw_win_plain(nb, W, H, g_wins[i].title, UI_SCALE, g_wins[i].chrome);
         struct SHEET *ms = sheet_alloc(g_shtctl);
         if (!ms) { page_free(nb, pages); out_file_str("[KERNEL/GUI] max:no sheet\n"); return; }
         sheet_setbuf(ms, nb, W, H, COL_INV);
@@ -375,6 +380,25 @@ extern "C" int win_is_maximized(struct SHEET *s) {
     return 0;
 }
 
+/* 取某图层的 chrome 位（1=关闭 2=最小化 4=最大化）*/
+static u32 win_chrome_of(struct SHEET *s) {
+    for (int i = 0; i < g_wincnt; i++)
+        if (g_wins[i].sht == s || g_wins[i].maxsht == s) return g_wins[i].chrome;
+    return 7;
+}
+
+/* 按当前 chrome 重画标题栏（SysAPI 改完标志后调用）*/
+static void win_redraw(int i) {
+    if (i < 0 || i >= g_wincnt || !g_wins[i].sht) return;
+    if (g_wins[i].maxed && g_wins[i].maxbuf) {
+        draw_win_plain(g_wins[i].maxbuf, g_hr2, g_vr2 - 40, g_wins[i].title, UI_SCALE, g_wins[i].chrome);
+    } else {
+        draw_win_shadow(g_wins[i].buf, g_wins[i].bw - 2 * SHADOW, g_wins[i].bh - 2 * SHADOW,
+                        g_wins[i].title, UI_SCALE, g_wins[i].chrome);
+    }
+    shtctl_refresh_all(g_shtctl);
+}
+
 static void win_remove(struct SHEET *s);   /* 前置声明（定义在下面）*/
 
 /* 标题栏最小化按钮：隐藏图层（窗口对象/状态保留），任务栏按钮变暗 */
@@ -382,6 +406,7 @@ extern "C" void win_minimize(struct SHEET *s) {
     out_file_str("[KERNEL/GUI] min:enter\n");
     for (int i = 0; i < g_wincnt; i++) {
         if (g_wins[i].sht != s && g_wins[i].maxsht != s) continue;
+        if (!(g_wins[i].chrome & 2)) return;            /* 该窗口禁用了最小化 */
         if (s->height < 0) { char hb[48]; ksprintf(hb, "[KERNEL/GUI] min:already h=%d\n", s->height); out_file_str(hb); return; }
         g_wins[i].min = 1;
         if (g_drag_sht == s) g_drag_sht = 0;
@@ -399,6 +424,7 @@ extern "C" void win_minimize(struct SHEET *s) {
 
 /* 关闭按钮：销毁窗口（删任务栏槽 + 释放图层 + 重绘）*/
 extern "C" void win_closed(struct SHEET *s) {
+    if (!(win_chrome_of(s) & 1)) { out_file_str("[KERNEL/GUI] close:disabled\n"); return; }
     win_remove(s);
     sheet_free(s);
     taskbar_draw();
@@ -432,6 +458,21 @@ extern "C" u64 syscall_dispatch(void) {
     u64 num, a1;
     __asm__ volatile("movq %%rax, %0" : "=r"(num));
     __asm__ volatile("movq %%rdi, %0" : "=r"(a1));
+    /* 3/4/5 = DisableMaximize / DisableMinimize / DisableClose
+       —— 软限制：只影响窗口按钮，管理员用 TerminateProcess 仍可结束进程 */
+    if (num >= 3 && num <= 5) {
+        u32 bit = (num == 3) ? 4u : (num == 4 ? 2u : 1u);
+        int idx = -1;
+        for (int i = g_wincnt - 1; i >= 0; i--) {
+            if (g_wins[i].sht && g_wins[i].sht != g_login_sht) { idx = i; break; }
+        }
+        if (idx < 0) return (u64)-1;
+        g_wins[idx].chrome &= ~bit;
+        win_redraw(idx);
+        { char db[64]; ksprintf(db, "[KERNEL/GUI] chrome=%x (syscall %d)\n",
+                                g_wins[idx].chrome, (int)num); out_file_str(db); }
+        return 0;
+    }
     if (num == 1) {
         /* 用户可访问区 = 已翻 US=1 的低内存（与上面 US 位翻转同一来源）。
            不能写死 8MB：.bss 涨到 10.6MB 后用户字符串/栈都在 8MB 以上，
@@ -708,7 +749,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             
     // ── 创建 "WinDOS" 演示窗口（带渐变阴影——合成：下层−depth×step）──
     static u32 win_buf[(200*UI_SCALE+2*SHADOW)*(120*UI_SCALE+2*SHADOW)];
-    draw_win_shadow(win_buf, 200*UI_SCALE, 120*UI_SCALE, "WinDOS", UI_SCALE, 1);
+    draw_win_shadow(win_buf, 200*UI_SCALE, 120*UI_SCALE, "WinDOS", UI_SCALE, 7);
     LOG_INFO("STARTUP drawn");
     /* 背景图层（sht_back）——独立缓冲 back_buf（原版做法）：
        背景是最底图层（sid=0，map 里 0 就代表"桌面"）
@@ -802,7 +843,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     LOG_INFO("[login]2 wbuf");
     static u32 login_wbuf[(LOGIN_W+2*SHADOW)*(LOGIN_H+2*SHADOW)];   /* ★ 带阴影（加大缓冲） */
     LOG_INFO("[login]3 draw_shadow");
-    draw_win_shadow(login_wbuf, LOGIN_W, LOGIN_H, "WinDOS Login", UI_SCALE, 0);   /* 登录窗不可最大化 → 图标灰 */
+    draw_win_shadow(login_wbuf, LOGIN_W, LOGIN_H, "WinDOS Login", UI_SCALE, 2);   /* 登录窗不可最大化 → 图标灰 */
     LOG_INFO("[login]4 put_str");
     put_str_cs(login_wbuf, LOGIN_W+2*SHADOW, LOGIN_W+2*SHADOW, LOGIN_H+2*SHADOW, 24+SHADOW, LOGIN_BY+SHADOW+4, "Username:", 0x00000000, UI_SCALE);   /* 标签黑字（带裁剪+缩放）*/
     fill_rect_c(login_wbuf, LOGIN_W+2*SHADOW, LOGIN_W+2*SHADOW, LOGIN_H+2*SHADOW,
@@ -827,10 +868,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     g_backfb = back_buf; g_back_sht = sht_back; g_hr2 = (int)hr; g_vr2 = (int)vr;
     { struct WinSlot *w = &g_wins[g_wincnt++];
       w->sht = win_sht; w->buf = win_buf; w->bw = 200*UI_SCALE+2*SHADOW; w->bh = 120*UI_SCALE+2*SHADOW;
-      w->col_inv = COL_INV; w->x = win_sht->vx0; w->y = win_sht->vy0; w->title = "WinDOS"; w->min = 0; }
+      w->col_inv = COL_INV; w->x = win_sht->vx0; w->y = win_sht->vy0; w->title = "WinDOS"; w->min = 0; w->chrome = 7; }
     { struct WinSlot *w = &g_wins[g_wincnt++];
       w->sht = login_sht; w->buf = login_wbuf; w->bw = LOGIN_W+2*SHADOW; w->bh = LOGIN_H+2*SHADOW;
-      w->col_inv = COL_INV; w->x = login_sht->vx0; w->y = login_sht->vy0; w->title = "Login"; w->min = 0; }
+      w->col_inv = COL_INV; w->x = login_sht->vx0; w->y = login_sht->vy0; w->title = "Login"; w->min = 0; w->chrome = 2; }   /* 只能最小化 */
     taskbar_draw();
     g_taskbar_paint = taskbar_paint;   /* refresh_all 也要画按钮 */
     shtctl_refresh_all(&shtctl);

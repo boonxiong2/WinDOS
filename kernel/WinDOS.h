@@ -51,6 +51,19 @@ static inline void WriteConsole(const char *s) {
         "movq $1, %%rax; movq %0, %%rdi; syscall"
         :: "r"((u64)s) : "rax", "rdi", "rcx", "r11", "memory");
 }
+/* ── 窗口按钮软限制（syscall 3/4/5）──
+   注意：这是"界面层"的限制，不是安全边界 —— 管理员权限下
+   TerminateProcess 依然可以结束进程。 */
+static inline void DisableMaximize(void) {
+    __asm__ volatile("movq $3, %%rax; syscall" ::: "rax", "rcx", "r11", "memory");
+}
+static inline void DisableMinimize(void) {
+    __asm__ volatile("movq $4, %%rax; syscall" ::: "rax", "rcx", "r11", "memory");
+}
+static inline void DisableClose(void) {
+    __asm__ volatile("movq $5, %%rax; syscall" ::: "rax", "rcx", "r11", "memory");
+}
+
 static inline void DrawRect(int x, int y, int w, int h, u32 color) {
     __asm__ volatile(
         "movq $2, %%rax; movq %0, %%rdi; movq %1, %%rsi; movq %2, %%rdx;"
