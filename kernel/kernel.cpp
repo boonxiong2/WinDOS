@@ -18,7 +18,24 @@
 NVMeDev g_nvme;   /* nvme.h 里是 extern：全部 .cpp 共用这一份 */
 volatile u64 *g_iosq = 0;
 volatile u64 *g_iocq = 0;
-u32 g_iosq_tail = 0, g_iocq_head = 0, g_iocq_phase = 1; /* 日志落盘（NVMe 裸扇区 sink；out_str 双写串口+盘）*/
+u32 g_iosq_tail = 0, g_iocq_head = 0, g_iocq_phase = 1;
+
+/* ── 文件日志：exFAT 挂上后把日志写进盘上的 WINDOS.LOG（16KB 缓冲批量写）── */
+static u8 g_flog[16384];
+static u32 g_flog_len = 0;
+static void filelog_flush(void) {
+    if (g_flog_len == 0) return;
+    /* 写整个缓冲（不是增量）——否则文件每次只剩最后一小段。
+       16KB 够装完整启动日志；满了就不再收新的（保留最早的）。 */
+    exfat_write_file("WINDOS.LOG", g_flog, g_flog_len);
+}
+static void filelog_sink(const char *s) {
+    while (*s) {
+        if (g_flog_len >= sizeof(g_flog)) return;      /* 缓冲满：丢弃后续（保留最早 16KB）*/
+        g_flog[g_flog_len++] = (u8)*s++;
+    }
+}
+ /* 日志落盘（NVMe 裸扇区 sink；out_str 双写串口+盘）*/
 
 struct BootInfo { u64 fb_base, fb_size; u32 hr, vr, stride, px_fmt; u16 tm_year; u8 tm_mon, tm_mday, tm_hour, tm_min, tm_sec;
                   /* ── 引导盘位置：UEFI（引导器）填的，不是内核猜的 ── */
@@ -128,7 +145,7 @@ static void draw_win(u32 *buf, int w, int h, const char *title) {
 
 /* s = UI 缩放（1=原尺寸；FHD 下用 UI_SCALE=2：标题栏/关闭钮/标题字一起放大）
    注：阴影带宽 SHADOW 不缩放（它同时被光标/拖拽/刷新联动引用，改动面太大） */
-static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
+static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s, int can_max) {
     int W = w + 2 * SHADOW, H = h + 2 * SHADOW;
     /* 内容区 + 标题栏：全部走带裁剪的矩形填充（原来手写循环——越界就踩别的全局变量） */
     fill_rect_c(buf, W, W, H, SHADOW, SHADOW, w, h, 0x00C0C0C0);                 /* 内容区（居中，四周留阴影带） */
@@ -143,14 +160,14 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
             if (px >= 0 && px < W && py >= 0 && py < H)      /* 关闭钮也加界检查 */
                 buf[py * W + px] = (closebtn[y / s][x / s] == '@') ? 0x00000000 : 0x00FFFFFF;
         }
-    /* 最大化按钮（关闭钮左边第二格）：白底 + 方框 */
+    /* 最大化按钮（关闭钮左边第二格）：白底 + 单个方框；不可最大化时画灰 */
     for (int y = 0; y < 14 * s; y++)
         for (int x = 0; x < 16 * s; x++) {
             int px = w - 53 * s + x + SHADOW, py = 5 * s + y + SHADOW;
             if (px >= 0 && px < W && py >= 0 && py < H) {
                 int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
-                int inner = (x >= 4 * s && x < 12 * s && y >= 4 * s && y < 10 * s);
-                buf[py * W + px] = (edge || inner) ? 0x00000000 : 0x00FFFFFF;
+                u32 fg = can_max ? 0x00000000 : 0x00AAAAAA;
+                buf[py * W + px] = edge ? fg : 0x00FFFFFF;
             }
         }
     /* 最小化按钮（关闭钮左边一格）：白底 + 一条黑色横杠 */
@@ -190,7 +207,7 @@ static void draw_win_shadow(u32 *buf, int w, int h, const char *title, int s) {
 
 /* 普通窗口绘制（最大化用）：缓冲正好 W×H，不画阴影带——
    带阴影的缓冲会被 refreshsub 当"合成层"处理，整屏会变暗。 */
-static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s) {
+static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s, int can_max) {
     fill_rect_c(buf, W, W, H, 0, 0, W, H, 0x00C0C0C0);                 /* 内容区 */
     fill_rect_c(buf, W, W, H, 0, 0, W, 24 * s, 0x00FFFFFF);            /* 标题栏 */
     fill_rect_c(buf, W, W, H, 0, 0, W, 2 * s, 0x00404040);             /* 上边框 */
@@ -208,8 +225,8 @@ static void draw_win_plain(u32 *buf, int W, int H, const char *title, int s) {
         int zx = W - 53 * s + x;
         if (zx >= 0 && zx < W && by >= 0 && by < H) {
             int edge = (x < s || x >= 15 * s || y < s || y >= 13 * s);
-            int inner = (x >= 4 * s && x < 12 * s && y >= 4 * s && y < 10 * s);
-            buf[by * W + zx] = (edge || inner) ? 0x00000000 : 0x00FFFFFF;
+            u32 fg = can_max ? 0x00000000 : 0x00AAAAAA;
+            buf[by * W + zx] = edge ? fg : 0x00FFFFFF;
         }
     }
 }
@@ -313,7 +330,7 @@ extern "C" void win_maximize(struct SHEET *s) {
         u32 pages = ((u32)W * (u32)H * 4u + 4095u) >> 12;
         u32 *nb = (u32*)page_alloc(pages);
         if (!nb) { out_file_str("[KERNEL/GUI] max:alloc fail\n"); return; }
-        draw_win_plain(nb, W, H, g_wins[i].title, UI_SCALE);
+        draw_win_plain(nb, W, H, g_wins[i].title, UI_SCALE, 1);
         struct SHEET *ms = sheet_alloc(g_shtctl);
         if (!ms) { page_free(nb, pages); out_file_str("[KERNEL/GUI] max:no sheet\n"); return; }
         sheet_setbuf(ms, nb, W, H, COL_INV);
@@ -691,7 +708,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
             
     // ── 创建 "WinDOS" 演示窗口（带渐变阴影——合成：下层−depth×step）──
     static u32 win_buf[(200*UI_SCALE+2*SHADOW)*(120*UI_SCALE+2*SHADOW)];
-    draw_win_shadow(win_buf, 200*UI_SCALE, 120*UI_SCALE, "WinDOS", UI_SCALE);
+    draw_win_shadow(win_buf, 200*UI_SCALE, 120*UI_SCALE, "WinDOS", UI_SCALE, 1);
     LOG_INFO("STARTUP drawn");
     /* 背景图层（sht_back）——独立缓冲 back_buf（原版做法）：
        背景是最底图层（sid=0，map 里 0 就代表"桌面"）
@@ -785,7 +802,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     LOG_INFO("[login]2 wbuf");
     static u32 login_wbuf[(LOGIN_W+2*SHADOW)*(LOGIN_H+2*SHADOW)];   /* ★ 带阴影（加大缓冲） */
     LOG_INFO("[login]3 draw_shadow");
-    draw_win_shadow(login_wbuf, LOGIN_W, LOGIN_H, "WinDOS Login", UI_SCALE);   /* ★ 阴影窗口 */
+    draw_win_shadow(login_wbuf, LOGIN_W, LOGIN_H, "WinDOS Login", UI_SCALE, 0);   /* 登录窗不可最大化 → 图标灰 */
     LOG_INFO("[login]4 put_str");
     put_str_cs(login_wbuf, LOGIN_W+2*SHADOW, LOGIN_W+2*SHADOW, LOGIN_H+2*SHADOW, 24+SHADOW, LOGIN_BY+SHADOW+4, "Username:", 0x00000000, UI_SCALE);   /* 标签黑字（带裁剪+缩放）*/
     fill_rect_c(login_wbuf, LOGIN_W+2*SHADOW, LOGIN_W+2*SHADOW, LOGIN_H+2*SHADOW,
@@ -993,9 +1010,11 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
            挂在裸扇区（LBA 2048 起 = 1MB 偏移），不依赖文件系统 */
         {
             char lb[96];
-            int lr = g_exfat_on_nvme ? -1 : logdisk_init();   /* exFAT 已挂 → 不用裸扇区日志（会踩卷）*/
-            ksprintf(lb, "[KERNEL/INFO] logdisk=%d (lba %d 起, 最多 %d 扇区)\n",
-                     lr, (int)LOGDISK_LBA0, (int)LOGDISK_MAX_SECT);
+            int lr;
+            if (g_exfat_on_nvme) { log_set_sink(filelog_sink); lr = 0; }   /* 文件日志：盘上 WINDOS.LOG */
+            else lr = logdisk_init();                                     /* 空白盘：裸扇区日志 */
+            ksprintf(lb, "[KERNEL/INFO] log=%s (r=%d)\n",
+                     g_exfat_on_nvme ? "WINDOS.LOG" : "raw lba2048", lr);
             out_file_str(lb);
         }
         if (r == 0) {
@@ -1070,7 +1089,8 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                 char dbg[64];
                 ksprintf(dbg, "[KERNEL/INFO] t=%d i21=%d SYSTEM ALIVE\n", g_ticks, _isr21_fires);
                 out_str_serial(dbg);
-                logdisk_flush();      /* 顺手把攒着的日志刷到盘（最多丢最后一小段） */
+                if (g_exfat_on_nvme) filelog_flush();   /* 文件日志 */
+                else logdisk_flush();                   /* 裸扇区日志 */
             }
             if(g_ticks % 100 == 0){
                 /* 任务栏时钟（GetTime 初始时间 + PIT 累加——走字） 不管他*/
@@ -1130,6 +1150,7 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
                            整个拆除→sysret 窗口内关中断：否则 isr2c 会在
                            sheet_free/shtctl_refresh_all 中间重入图层表。
                            sysret 从 R11(0x202) 恢复 IF=1——用户态照常有中断。 */
+                        if (g_exfat_on_nvme) filelog_flush();
                         io_cli();
                         win_remove(login_sht);      /* 任务栏里也删掉 Login 按钮 */
                         sheet_free(login_sht);
