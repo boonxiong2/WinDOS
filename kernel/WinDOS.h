@@ -63,6 +63,13 @@ static inline void DisableMinimize(void) {
 static inline void DisableClose(void) {
     __asm__ volatile("movq $5, %%rax; syscall" ::: "rax", "rcx", "r11", "memory");
 }
+/* TerminateProcess(pid)：无视上述软限制强制结束目标。
+   ⚠️ 目前只有"当前唯一进程"，pid 被忽略；实现是强制销毁窗口——
+   真正的进程终止（抢占 + 上下文回收）要等调度器接上。 */
+static inline void TerminateProcess(u32 pid) {
+    __asm__ volatile("movq $6, %%rax; movq %0, %%rdi; syscall"
+                     :: "r"((u64)pid) : "rax", "rdi", "rcx", "r11", "memory");
+}
 
 static inline void DrawRect(int x, int y, int w, int h, u32 color) {
     __asm__ volatile(

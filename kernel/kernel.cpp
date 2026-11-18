@@ -399,6 +399,21 @@ static void win_redraw(int i) {
     shtctl_refresh_all(g_shtctl);
 }
 
+static void win_remove(struct SHEET *s);   /* 前置声明 */
+
+/* 强制销毁窗口（TerminateProcess 用：无视 DisableClose）*/
+static void win_kill(int i) {
+    if (i < 0 || i >= g_wincnt) return;
+    struct SHEET *s = g_wins[i].sht, *ms = g_wins[i].maxsht;
+    if (ms) { sheet_free(ms); g_wins[i].maxsht = 0; }
+    if (g_wins[i].maxbuf) { page_free(g_wins[i].maxbuf, g_wins[i].maxbuf_pages); g_wins[i].maxbuf = 0; }
+    win_remove(s);
+    if (s) sheet_free(s);
+    taskbar_draw();
+    shtctl_refresh_all(g_shtctl);
+    { char db[64]; ksprintf(db, "[KERNEL/GUI] terminated (forced, chrome=%x)\n", g_wins[i].chrome); out_file_str(db); }
+}
+
 static void win_remove(struct SHEET *s);   /* 前置声明（定义在下面）*/
 
 /* 标题栏最小化按钮：隐藏图层（窗口对象/状态保留），任务栏按钮变暗 */
@@ -471,6 +486,17 @@ extern "C" u64 syscall_dispatch(void) {
         win_redraw(idx);
         { char db[64]; ksprintf(db, "[KERNEL/GUI] chrome=%x (syscall %d)\n",
                                 g_wins[idx].chrome, (int)num); out_file_str(db); }
+        return 0;
+    }
+    /* 6 = TerminateProcess(pid)：当前只有一个"进程"，pid 忽略。
+       ⚠️ 现有实现只强制销毁窗口（无视 DisableClose）；真正的进程终止要等调度器。*/
+    if (num == 6) {
+        int idx = -1;
+        for (int i = g_wincnt - 1; i >= 0; i--) {
+            if (g_wins[i].sht && g_wins[i].sht != g_login_sht) { idx = i; break; }
+        }
+        if (idx < 0) return (u64)-1;
+        win_kill(idx);
         return 0;
     }
     if (num == 1) {

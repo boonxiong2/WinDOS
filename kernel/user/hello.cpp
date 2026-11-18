@@ -32,6 +32,8 @@ extern "C" void user_main(void) {
     DisableMinimize();
     DisableClose();
     WriteConsole("CHROME APIS OK\n");
+    WriteConsole("NOW TERMINATE (close disabled)\n");
+    TerminateProcess(0);   /* 无视 DisableClose：强制销毁窗口 */
 
     /* idle loop: mouse is handled by isr2c (kernel), so no polling API —
        just spin; PIT IRQs (IF=1) keep firing: isr20 → sysretq back. */
