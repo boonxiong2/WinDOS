@@ -19,7 +19,13 @@
 | 用户态 | 登录 → `sysret` 进 **Ring3** → `syscall` 回内核（`SYS_WRITE` 已通）；`info registers` 里 `CPL=3 / CS=002b / SS=0023` |
 | 安全模型 | `IOPL=0` + `UMIP`（CPUID 门控）+ IDT 页 `US=0` + syscall 指针校验（上界按 `_bss_end` 推导，不写死 8MB） |
 | 崩溃处理 | Win11 风格黑屏 + **崩溃处理自身安全**（防重入 + 显存指针合法性检查，不可信时只打串口不画屏） |
-| 存储 | ATA PIO 真盘 **读 + 写**：读出 FAT 引导扇区 `"MSWIN4.1"`；签名盘写扇区并读回 = `WRITE_OK` |
+| 存储（ATA） | ATA PIO 真盘 **读 + 写**：读出 FAT 引导扇区 `"MSWIN4.1"`；签名盘写扇区并读回 = `WRITE_OK` |
+| 存储（NVMe） | **全栈**：PCI 枚举 → BAR0(64 位, `0x800000000`) 映射进页表(US=0) → `CAP=0x004008200F0107FF` → `CC=0x00460001` → `CSTS.RDY=1` → `IDENTIFY`(`SN="WINDBG01"`, `NS=256`) → I/O 队列 → **LBA 读写回读一致** |
+| 文件系统 | ExFAT **读 + 写闭环**：写 `TEST.TXT` → 列表 → 读回内容一致；根目录簇从 BPB 读（不写死）；位图整簇写 |
+| 文件系统 × NVMe | **exFAT 挂在 NVMe 上**：块层抽象（NVMe 优先 / ATA 回落）+ 4KB bounce 缓冲 → 在 NVMe 盘的 exFAT 卷里写 `NVME.TXT` 并读回 |
+| 内存 | **UEFI 动态堆 64MB**（`AllocatePages` → `BootInfo` → `page_init`），位图页分配器 + 自检；不再靠写死的 `.bss` 预留 |
+| 窗口管理 | 任务栏按钮（每窗口一个）· 最小化（隐藏，对象保留）· 最大化（独立全屏图层，来自动态堆）· **拖最大化窗口 = 还原到光标**（Windows 行为） |
+| 日志 | 双写：串口 + **NVMe 裸扇区**（LBA 2048 起）；心跳只进串口（否则盘上大半是心跳） |
 | 绘制基元 | `sys/draw.h` 带裁剪的 fill / blit / text + **哨兵自检**（启动日志 `[DRAW] selftest PASS`） |
 
 ## 快速开始
@@ -72,9 +78,10 @@ IDEAS.md             路线图 + Bug Reports
 
 ## 还没做（诚实清单）
 
-- **ExFAT 写**还不完整：缺 `SetChecksum` / `NameHash` 等字段、只支持单簇、只写根目录、位图只写一扇区
+- **ExFAT 写**仍有限制：只支持**单簇**（≤4KB）、**同名不覆盖**（每次新建条目）、缺 `SetChecksum` / `NameHash`（Windows 可能判目录项损坏）
 - **USB / xHCI 完全没有**：插 U 盘用不了；运行中插入设备"完全无感"；真机上这意味着 USB 键鼠也点不动
-- **NVMe** 未通（PCI 读的那个坑已修，待重试 64 位 BAR）
+- **NVMe 没有分区/文件系统初始化**：能读写扇区、能挂已有 exFAT 卷，但不会自己格式化盘；不支持 PRP 列表（单次 ≤4KB）
+- **没有进程/调度抽象**：无 SMP/APIC/ACPI（单核 + 8259 PIC）；无 FAT32 驱动；无 VFS
 - 无 SMP / APIC / ACPI（单核 + 8259 PIC）；无 FAT32 驱动；无 VFS / 进程抽象
 - 真机移植项（Secure Boot 签名、看门狗、显存像素格式、4K 防越界、USB HID…）清单见 `docs/内核避坑手册.md §7`
 - UI：任务栏与时钟仍是 1×（其余已按 `UI_SCALE=2` 放大）
