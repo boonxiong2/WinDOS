@@ -319,7 +319,7 @@ fn start_kernel() -> ! {
     uinfo_hex("kern src", kern_src); uinfo_hex("kern len", kern_len);
     if kern_len == 0 { ucrit("no kern"); bsod(mode.fb, stride, hr, vr); }
     /* 分配内核区（kern_len + 6MB BSS + BootInfo）*/
-    let total = kern_len + 0x1000000 + core::mem::size_of::<BootInfo>();   /* +16MB：.bss 已涨到 ~10.3MB（back_buf 1.92MB 等） */
+    let total = kern_len + 0x400000 + core::mem::size_of::<BootInfo>();   /* +4MB：大缓冲已挪到 UEFI 动态堆，.bss 只剩小对象 */
     let mut kern: usize = 0;
     unsafe { ap(0,2,(total+0xFFF)>>12,&mut kern); }
     uinfo_hex("kern alloc", kern); uinfo_hex("total", total);

@@ -671,8 +671,11 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
        lm_map = 屏幕映射数组（每像素记"属于哪个图层"，供刷新用）
        shtctl = 图层管理器：管理所有图层（背景/窗口/光标）的叠放和刷新
        声明顺序重要：lm_map 在前、shtctl 在后，BSS 里不重叠 */
-    static u8 lm_map[1920*1080];  // 屏幕映射数组（预留到 FHD）
+    /* 屏幕映射数组：从动态堆分配（原来是 .bss 里 2MB 静态数组）*/
+    u8 *lm_map = (u8*)page_alloc((1920u*1080u + 4095u) >> 12);
+    if (!lm_map) { LOG_CRITICAL("lm_map alloc fail"); for(;;) __asm__ volatile("hlt"); }
     static SHTCTL shtctl; shtctl_init(&shtctl, fb, hr, vr, lm_map);
+    { char mb[64]; ksprintf(mb, "[KERNEL/MEM] lm_map=%x free=%d\n", (u32)(u64)lm_map, page_free_pages()); out_file_str(mb); }
     LOG_INFO("STARTUP lmi");
     { char dbg[48]; ksprintf(dbg,"[KERNEL/INFO] fb=%x hr=%d vr=%d st=%d",(u32)(u64)fb,hr,vr,st); LOG_INFO(dbg); }
 
@@ -698,7 +701,10 @@ extern "C" __attribute__((section(".text.start"))) void _start(BootInfo *info) {
     /* 按最大模式(1920x1080)开——下面填充循环和 sheet_setbuf 都用 hr/vr，
        800x600 的数组按 1280x800 用会越界写 ~2.1MB，正好糊掉
        cur_buf / kstack / login_wbuf / g_fb / tss / user_stack */
-    static u32 back_buf[1920*1080];
+    /* 背景缓冲：从动态堆分配（原来是 .bss 里 8.3MB 静态数组）*/
+    u32 *back_buf = (u32*)page_alloc((1920u*1080u*4u + 4095u) >> 12);
+    if (!back_buf) { LOG_CRITICAL("back_buf alloc fail"); for(;;) __asm__ volatile("hlt"); }
+    { char mb[64]; ksprintf(mb, "[KERNEL/MEM] back_buf=%x free=%d\n", (u32)(u64)back_buf, page_free_pages()); out_file_str(mb); }
     /* background + taskbar (bottom 40px black) — must MATCH the desktop
        drawn by shtctl_refresh_all, or dragging a window over the taskbar
        erases it (back sheet repaints its buffer over it) */
